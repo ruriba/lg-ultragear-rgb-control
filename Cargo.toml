@@ -1,0 +1,53 @@
+[package]
+name = "lg-ultragear-rgb-control"
+version = "1.0.0"
+edition = "2021"
+
+[build-dependencies]
+winresource = "0.1"
+# Compiles src/compute.hlsl to DXBC at build time (only the build host needs
+# d3dcompiler_47; the shipped exe never does).
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D_Fxc",
+    "Win32_System_LibraryLoader",
+] }
+
+[dependencies]
+tray-icon = "0.19"
+hidapi = "2.6"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Our only direct windows stack (wasapi pulls its own windows 0.62 tree).
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_System_Threading",   # below-normal priority + single-instance mutex
+    "Win32_Security",           # required by CreateMutexW's signature
+    "Win32_System_Registry",    # autostart
+    "Win32_Globalization",      # UI language detection
+    "Win32_UI_Controls_Dialogs", # custom color picker (ChooseColor)
+    "Win32_UI_WindowsAndMessaging", # message window (event pump, WM_DISPLAYCHANGE)
+    "Win32_UI_HiDpi",           # per-monitor DPI awareness (menu/dialog crispness)
+    "Win32_System_LibraryLoader",   # GetModuleHandleW + uxtheme dark-mode ordinals
+    "Win32_Devices_Display",    # RGB-strip monitor detection (QueryDisplayConfig)
+    "Win32_Graphics_Gdi",       # monitor info for dialog centering
+] }
+wasapi = "0.24.0"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
+
+# link.exe (MSVC) writes informational chatter to stdout ("Creando biblioteca
+# ... y objeto ..."); rustc surfaces it as the `linker_messages` warning since
+# 1.81. It carries no information, so allow it — real linker errors still fail
+# the build loudly.
+[lints.rust]
+linker_messages = "allow"
