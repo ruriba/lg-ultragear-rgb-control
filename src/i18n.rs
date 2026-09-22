@@ -117,6 +117,9 @@ pub struct Lang {
     pub quit: &'static str,
     pub connected: &'static str,
     pub disconnected: &'static str,
+    /// Engine-failure status lines; {0} is replaced by the error detail.
+    pub fail_image: &'static str,
+    pub fail_audio: &'static str,
 }
 
 pub const ES: Lang = Lang {
@@ -160,6 +163,8 @@ pub const ES: Lang = Lang {
     quit: "Salir",
     connected: "Conectado",
     disconnected: "No conectado",
+    fail_image: "Sincronización de imagen no disponible: {0}",
+    fail_audio: "Sincronización de audio: captura de audio no disponible: {0}",
 };
 
 pub const EN: Lang = Lang {
@@ -203,6 +208,8 @@ pub const EN: Lang = Lang {
     quit: "Exit",
     connected: "Connected",
     disconnected: "Disconnected",
+    fail_image: "Image sync unavailable: {0}",
+    fail_audio: "Audio sync: audio capture unavailable: {0}",
 };
 
 pub const FR: Lang = Lang {
@@ -246,6 +253,8 @@ pub const FR: Lang = Lang {
     quit: "Quitter",
     connected: "Connecté",
     disconnected: "Déconnecté",
+    fail_image: "Synchronisation d'image indisponible : {0}",
+    fail_audio: "Synchronisation audio : capture audio indisponible : {0}",
 };
 
 pub const DE: Lang = Lang {
@@ -289,6 +298,8 @@ pub const DE: Lang = Lang {
     quit: "Beenden",
     connected: "Verbunden",
     disconnected: "Getrennt",
+    fail_image: "Bildsynchronisation nicht verfügbar: {0}",
+    fail_audio: "Audiosynchronisation: Audioaufnahme nicht verfügbar: {0}",
 };
 
 pub const PT: Lang = Lang {
@@ -332,6 +343,8 @@ pub const PT: Lang = Lang {
     quit: "Sair",
     connected: "Conectado",
     disconnected: "Desconectado",
+    fail_image: "Sincronização de imagem indisponível: {0}",
+    fail_audio: "Sincronização de áudio: captura de áudio indisponível: {0}",
 };
 
 pub const IT: Lang = Lang {
@@ -375,6 +388,8 @@ pub const IT: Lang = Lang {
     quit: "Esci",
     connected: "Connesso",
     disconnected: "Disconnesso",
+    fail_image: "Sincronizzazione immagine non disponibile: {0}",
+    fail_audio: "Sincronizzazione audio: acquisizione audio non disponibile: {0}",
 };
 
 pub const RU: Lang = Lang {
@@ -418,6 +433,8 @@ pub const RU: Lang = Lang {
     quit: "Выход",
     connected: "Подключено",
     disconnected: "Отключено",
+    fail_image: "Синхронизация изображения недоступна: {0}",
+    fail_audio: "Аудиосинхронизация: захват звука недоступен: {0}",
 };
 
 pub const JA: Lang = Lang {
@@ -461,6 +478,8 @@ pub const JA: Lang = Lang {
     quit: "終了",
     connected: "接続済み",
     disconnected: "未接続",
+    fail_image: "イメージ同期を利用できません: {0}",
+    fail_audio: "オーディオ同期: 音声キャプチャを利用できません: {0}",
 };
 
 pub const ZH: Lang = Lang {
@@ -504,6 +523,8 @@ pub const ZH: Lang = Lang {
     quit: "退出",
     connected: "已连接",
     disconnected: "未连接",
+    fail_image: "图像同步不可用：{0}",
+    fail_audio: "音频同步：音频捕获不可用：{0}",
 };
 
 pub const KO: Lang = Lang {
@@ -547,4 +568,6 @@ pub const KO: Lang = Lang {
     quit: "종료",
     connected: "연결됨",
     disconnected: "연결 안 됨",
+    fail_image: "이미지 동기화를 사용할 수 없음: {0}",
+    fail_audio: "오디오 동기화: 오디오 캡처를 사용할 수 없음: {0}",
 };

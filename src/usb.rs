@@ -74,11 +74,14 @@ pub fn spawn_usb_thread(
 }
 
 fn usb_loop(rx: Receiver<UsbCommand>, connected: &AtomicBool, events: &Events) {
-    let Ok(mut api) = HidApi::new() else {
-        eprintln!("Failed to initialize HidApi");
-        return;
-    };
-    let mut device = open_monitor(&api);
+    // HidApi::new can fail transiently (USB stack still settling at logon).
+    // Retrying on the reconnect cadence keeps the worker alive; returning
+    // here would silently no-op every menu action for the process lifetime.
+    let mut api: Option<HidApi> = HidApi::new().ok();
+    if api.is_none() {
+        eprintln!("Failed to initialize HidApi; will retry");
+    }
+    let mut device = api.as_ref().and_then(open_monitor);
     let mut fails = 0u32;
     let mut active_session = 0u64;
     let mut last_attempt = Instant::now();
@@ -124,9 +127,14 @@ fn usb_loop(rx: Receiver<UsbCommand>, connected: &AtomicBool, events: &Events) {
         // SetSession is pure bookkeeping: process it even without a device —
         // dropping it while the monitor was missing left active_session
         // stale, so after a reconnect every image sync frame was discarded
+        // forever. Monotonic: a SetSession parked in Engine::send's fallback
+        // thread can land after a newer session's registration; letting it
+        // regress active_session would discard the live session's frames
         // forever.
         if let UsbCommand::SetSession(s) = cmd {
-            active_session = s;
+            if s > active_session {
+                active_session = s;
+            }
             continue;
         }
 
@@ -191,8 +199,11 @@ fn execute(cmd: &UsbCommand, dev: &HidDevice, active_session: u64) -> bool {
             usb_protocol::store_static_color(dev, *slot, *r, *g, *b)
         }
         UsbCommand::SetSession(_) | UsbCommand::Stop => {
-            // Handled by the drain loop before the device guard.
-            unreachable!()
+            // Handled by the drain loop before the device guard. Reachable
+            // only if that routing ever changes: ignore rather than panic —
+            // a panic here kills the USB worker and with it every monitor
+            // action for the rest of the process.
+            true
         }
     }
 }
@@ -224,13 +235,25 @@ fn on_write(
 /// path, so stale paths would never match again). While connected, probes the
 /// enumeration so an unplug during idle updates the connection state.
 fn maintain(
-    api: &mut HidApi,
+    api: &mut Option<HidApi>,
     device: &mut Option<HidDevice>,
     last_attempt: &mut Instant,
     last_probe: &mut Instant,
     connected: &AtomicBool,
     events: &Events,
 ) {
+    // A failed HidApi init retries on the same cadence as a reconnect.
+    if api.is_none() {
+        if last_attempt.elapsed() < RECONNECT_EVERY {
+            return;
+        }
+        *last_attempt = Instant::now();
+        *api = HidApi::new().ok();
+        if api.is_none() {
+            return;
+        }
+    }
+    let api = api.as_mut().expect("api is Some above");
     if device.is_none() {
         if last_attempt.elapsed() < RECONNECT_EVERY {
             return;

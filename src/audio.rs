@@ -14,6 +14,10 @@ use wasapi::{
 const POLL_EVERY: Duration = Duration::from_millis(33);
 /// Loopback buffer in 100 ns units: 200 ms, generous slack against overrun.
 const BUFFER_HNS: i64 = 2_000_000;
+/// How often the default render device's identity is re-checked (~1 s of
+/// polls): a device switch leaves the old loopback capturing that old
+/// device's silence without ever failing.
+const DEVICE_CHECK_POLLS: u32 = 30;
 
 /// What the audio sync paints: the rainbow sweep or one solid color.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize, serde::Deserialize)]
@@ -72,6 +76,9 @@ pub struct LoopbackLoudness {
     queue: VecDeque<u8>,
     /// Envelope state (fast attack, slow release) in 0..1.
     level: f32,
+    /// Friendly name of the render device the loopback was opened on.
+    device_name: String,
+    polls_since_check: u32,
 }
 
 impl LoopbackLoudness {
@@ -85,6 +92,7 @@ impl LoopbackLoudness {
         let device = enumerator
             .get_default_device(&Direction::Render)
             .map_err(|e| e.to_string())?;
+        let device_name = device.get_friendlyname().map_err(|e| e.to_string())?;
         let mut audio_client = device.get_iaudioclient().map_err(|e| e.to_string())?;
         let format: WaveFormat = audio_client.get_mixformat().map_err(|e| e.to_string())?;
         // Capture direction on a render device = loopback: the crate sets
@@ -108,7 +116,27 @@ impl LoopbackLoudness {
             capture_client,
             queue: VecDeque::new(),
             level: 0.0,
+            device_name,
+            polls_since_check: 0,
         })
+    }
+
+    /// True when the default render device's friendly name differs from the
+    /// one this loopback was opened on: the old capture then keeps
+    /// delivering that device's silence without ever failing, and only a
+    /// reopen picks up the new output. Errors read as "unchanged" — a real
+    /// device loss surfaces through the capture failures instead.
+    fn default_device_changed(&self) -> bool {
+        let Ok(enumerator) = DeviceEnumerator::new() else {
+            return false;
+        };
+        let Ok(device) = enumerator.get_default_device(&Direction::Render) else {
+            return false;
+        };
+        device
+            .get_friendlyname()
+            .map(|name| name != self.device_name)
+            .unwrap_or(false)
     }
 
     /// Waits one frame period, drains everything played since the last call
@@ -118,6 +146,13 @@ impl LoopbackLoudness {
     /// reopens the loopback after a run of consecutive failures.
     pub fn next_level(&mut self, gain: f32, blink: Blink, range: DynamicRange) -> Option<f32> {
         std::thread::sleep(POLL_EVERY);
+        self.polls_since_check += 1;
+        if self.polls_since_check >= DEVICE_CHECK_POLLS {
+            self.polls_since_check = 0;
+            if self.default_device_changed() {
+                return None;
+            }
+        }
         // Drain every packet available: read_from_device_to_deque fetches a
         // single WASAPI packet per call, and a 33 ms poll that ate one ~10 ms
         // packet would fall permanently behind in the 200 ms buffer.

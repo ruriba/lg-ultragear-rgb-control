@@ -555,13 +555,20 @@ pub fn build_menu(ui: &Ui) -> Menu {
     menu
 }
 
-/// Repaints the status line and tray tooltip from the current connection
-/// flag. No device traffic: safe at any moment, startup included.
-fn repaint_connection(ui: &mut Ui) {
-    let state = if ui.connected.load(Ordering::SeqCst) {
-        t().connected
+/// Recomputes the two glanceable surfaces (status line + tray tooltip) from
+/// the current state: connection first, then what the app is doing. Call on
+/// every state change that can affect them. No device traffic: safe at any
+/// moment, startup included. Deliberately NOT called after an engine-failure
+/// event — that text must stick until the user acts on it.
+pub fn refresh_status(ui: &mut Ui) {
+    let state = if !ui.connected.load(Ordering::SeqCst) {
+        t().disconnected.to_string()
     } else {
-        t().disconnected
+        match ui.sync {
+            SyncActive::ImageSync => "Image Sync".to_string(),
+            SyncActive::Audio => "Audio Sync".to_string(),
+            SyncActive::None => t().connected.to_string(),
+        }
     };
     let tooltip = format!("LG UltraGear RGB Control — {state}");
     if let Some(tray) = &ui.tray {
@@ -573,7 +580,7 @@ fn repaint_connection(ui: &mut Ui) {
 pub fn handle_event(id: String, ui: &mut Ui, quit: &mut bool) {
     match id.as_str() {
         usb::CONNECTION_EVENT => {
-            repaint_connection(ui);
+            refresh_status(ui);
             // The monitor just appeared with factory state, and restore
             // commands sent while it was absent were discarded by the USB
             // worker. Re-push what this app last set (sync modes 7/8 skipped:
@@ -591,7 +598,7 @@ pub fn handle_event(id: String, ui: &mut Ui, quit: &mut bool) {
             // texts (possibly stale-false): repaint only. The restore is
             // already enqueued by build_ui, and a reconnect push here would
             // drag a resuming sync out of its mode.
-            repaint_connection(ui);
+            refresh_status(ui);
         }
 
         events::CHANGED_EVENT => redetect_screen(ui),
@@ -641,9 +648,15 @@ pub fn handle_event(id: String, ui: &mut Ui, quit: &mut bool) {
             // process both immediately.
             let engine = ui.engine.clone();
             let level = ui.brightness.unwrap_or(12);
+            // Keep an explicitly selected static mode across exit; only sync
+            // modes (and a never-set state) fall back to Static 1 to disarm.
+            let restore_mode = match ui.mode {
+                Some(m) if (1..=6).contains(&m) => m,
+                _ => 1,
+            };
             thread::spawn(move || {
                 engine.send(UsbCommand::SetBrightness(level));
-                engine.send(UsbCommand::SetMode(1));
+                engine.send(UsbCommand::SetMode(restore_mode));
                 engine.send(UsbCommand::Stop);
             });
             *quit = true;
@@ -651,9 +664,28 @@ pub fn handle_event(id: String, ui: &mut Ui, quit: &mut bool) {
 
         _ => {
             if let Some(detail) = id.strip_prefix(ENGINE_FAILED_EVENT) {
-                ui.status_item.set_text(detail);
-                // The engine gave up on its own: uncheck so the menu matches
-                // reality and a retry from the menu is possible.
+                // Structured payload "<kind>;<detail>": the sentence is
+                // localized here; the detail is the raw error text.
+                let (kind, err) = detail.split_once(';').unwrap_or(("", detail));
+                let text = match kind {
+                    "image" => t().fail_image.replace("{0}", err),
+                    "audio" => t().fail_audio.replace("{0}", err),
+                    _ => detail.to_string(),
+                };
+                ui.status_item.set_text(text);
+                // The engine gave up on its own (terminal GPU or audio
+                // error): disarm the monitor — it is still armed at sync
+                // brightness and would sit there through the ~12 s sync
+                // timeout. Mode first, then brightness: the monitor ignores
+                // brightness while it stays armed (same order as
+                // stop_engine).
+                ui.resume = None;
+                ui.engine.send(UsbCommand::SetMode(1));
+                ui.mode = Some(1);
+                ui.engine
+                    .send(UsbCommand::SetBrightness(ui.brightness.unwrap_or(12)));
+                // Uncheck so the menu matches reality and a retry from the
+                // menu is possible.
                 ui.sync = SyncActive::None;
             } else if let Some(mode) = parse_sampling_mode(&id) {
                 tweak(ui, ui.params.sampling == mode, |p| p.sampling = mode);
@@ -860,6 +892,7 @@ fn stop_engine(ui: &mut Ui, restore_static1: bool) {
             .send(UsbCommand::SetBrightness(ui.brightness.unwrap_or(12)));
     }
     ui.sync = SyncActive::None;
+    refresh_status(ui);
 }
 
 fn parse_sampling_mode(id: &str) -> Option<SamplingMode> {
@@ -967,6 +1000,9 @@ fn start_sync(ui: &mut Ui, which: SyncActive) {
         }
         SyncActive::None => {}
     }
+    // The tray surfaces now show the running sync (and clear any stale
+    // failure text from a previous self-failed start).
+    refresh_status(ui);
 }
 
 fn parse_preset<T: Copy>(id: &str, prefix: &str, table: &[(Label, T)]) -> Option<T> {

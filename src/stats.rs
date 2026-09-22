@@ -41,10 +41,9 @@ pub struct FrameStats {
     /// GPU dispatch duration from timestamp queries; NaN when the query
     /// failed or came back not-ready.
     pub gpu_ms: f32,
-    /// Resource creations on this frame (1/1 today — the evidence for the
-    /// persistent-staging and SRV-cache decisions).
+    /// Resource creations on this frame (the SRV is the only one left; the
+    /// staging readback buffer became session-persistent in v1.1).
     pub srv_created: u8,
-    pub staging_created: u8,
     /// Per-frame pixel format (MPO setups can flip it mid-session).
     pub hdr: bool,
 }

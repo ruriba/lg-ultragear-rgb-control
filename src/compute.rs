@@ -153,6 +153,11 @@ impl ComputeAvg {
                 )
                 .map_err(|e| format!("cbuffer: {e}"))?;
             let cbuffer = cbuffer.ok_or("cbuffer: null")?;
+            // Bind it once for the context's lifetime — nothing else ever
+            // touches slot b0. Forgetting this left the shader's HDR flag
+            // reading zeros: the buffer was updated every frame but never
+            // actually bound, silently disabling the FP16 color path.
+            context.CSSetConstantBuffers(0, Some(&[Some(cbuffer.clone())]));
 
             let mut blocks_srv = None;
             device

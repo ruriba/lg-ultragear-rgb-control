@@ -26,7 +26,7 @@ mod usb;
 mod usb_protocol;
 
 use engine::Engine;
-use menu::{build_menu, build_ui, handle_event};
+use menu::{build_menu, build_ui, handle_event, refresh_status};
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -81,12 +81,29 @@ fn main() {
         .build()
         .expect("failed to create tray icon");
     ui.tray = Some(tray);
+    // Normalize both glanceable surfaces around the state start_sync left
+    // (a resumed sync shows as running, not as the bare connection state).
+    refresh_status(&mut ui);
 
     // Returns when handle_event sets quit (or the loop dies).
     events::pump(&mut ui, handle_event);
 
-    // Bounded: ~1 s per queued write at worst, so this join cannot hang.
-    let _ = usb_handle.join();
+    // Bounded: ~1 s per queued write at worst, so this join cannot hang —
+    // unless a HID write itself never completes (stalled device): a blocked
+    // worker never processes Stop and never reaches the disconnect path.
+    // The process must never linger holding the single-instance mutex, so
+    // watchdog the join and force the exit.
+    let (done_tx, done_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = usb_handle.join();
+        let _ = done_tx.send(());
+    });
+    if done_rx
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .is_err()
+    {
+        std::process::exit(0);
+    }
 }
 
 fn build_icon() -> tray_icon::Icon {
@@ -100,10 +117,19 @@ fn install_panic_hook() {
     const LOG_CAP_BYTES: u64 = 1_000_000;
     std::panic::set_hook(Box::new(|info| {
         let line = format!("panic: {info}\n");
-        let log_path = std::env::current_exe()
+        let name = "lg-ultragear-rgb-control.log";
+        // Exe dir first (portable installs keep everything together);
+        // %TEMP% when that is not writable (program-files installs), so a
+        // panic report never vanishes.
+        let mut paths = Vec::new();
+        if let Some(exe_dir) = std::env::current_exe()
             .ok()
-            .and_then(|p| p.parent().map(|d| d.join("lg-ultragear-rgb-control.log")));
-        if let Some(path) = log_path {
+            .and_then(|p| p.parent().map(|d| d.to_path_buf()))
+        {
+            paths.push(exe_dir.join(name));
+        }
+        paths.push(std::env::temp_dir().join(name));
+        for path in paths {
             let oversized = std::fs::metadata(&path)
                 .map(|m| m.len() > LOG_CAP_BYTES)
                 .unwrap_or(false);

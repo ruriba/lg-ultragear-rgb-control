@@ -6,6 +6,7 @@ use crate::audio::{self, AudioColor, Blink, DynamicRange};
 use crate::capture::{CaptureError, Capturer};
 use crate::events::Events;
 use crate::sampling::{self, SamplingMode};
+use crate::stats::StatsLog;
 use crate::usb::UsbCommand;
 use crate::usb_protocol::RGBColor;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
@@ -380,6 +381,179 @@ fn reinit_commands(mode: u8) -> [UsbCommand; 3] {
     ]
 }
 
+/// Re-arms the device for `mode`: the init sequence, the arming settle, and
+/// a re-assert of the chunk count once the MCU is quiet. Shared by both
+/// loops so their reinit paths can never diverge. Returns false when the
+/// session was superseded or the USB writer went away: the caller must
+/// return immediately.
+fn rearm(tx: &SyncSender<UsbCommand>, state: &EngineState, mine: u64, mode: u8) -> bool {
+    for cmd in reinit_commands(mode) {
+        if !state.is_valid(mine) || tx.send(cmd).is_err() {
+            return false;
+        }
+    }
+    thread::sleep(INIT_SETTLE);
+    // Re-assert the chunk count now that the mode switch has settled: a
+    // count swallowed while the MCU was busy leaves frames applying only
+    // their first chunk.
+    if !state.is_valid(mine) || tx.send(UsbCommand::ArmSync(mode)).is_err() {
+        return false;
+    }
+    state.is_valid(mine)
+}
+
+/// What [`ensure_capturer`] decided for this iteration.
+enum CapturerOutcome {
+    /// A fresh duplication; keep iterating with it.
+    Ready(Box<Capturer>),
+    /// Nothing to do this iteration (pacing sleep or failed creation); the
+    /// caller continues the loop.
+    Wait,
+    /// This machine cannot run Image Sync at all; the caller must return.
+    GiveUp,
+}
+
+/// Creates the duplication, applying the retry pacing between attempts and
+/// re-arming the monitor when an outage was just served. `reinit_needed` is
+/// set when the monitor sat unarmed through its sync timeout.
+#[allow(clippy::too_many_arguments)]
+fn ensure_capturer(
+    screen: &str,
+    sampling: SamplingMode,
+    state: &EngineState,
+    mine: u64,
+    events: &Events,
+    first_creation: &mut bool,
+    create_fails: &mut u32,
+    reinit_needed: &mut bool,
+    stats_log: &mut StatsLog,
+    stats_started: &Instant,
+) -> CapturerOutcome {
+    let retry = !*first_creation;
+    *first_creation = false;
+    if retry {
+        thread::sleep(RETRY_DELAY);
+    }
+    if !state.is_valid(mine) {
+        return CapturerOutcome::Wait;
+    }
+    match Capturer::new(screen, sampling) {
+        Ok(c) => {
+            let (w, h) = c.dimensions();
+            println!("Capturing {}x{}{}", w, h, if c.hdr() { " HDR" } else { "" });
+            stats_log.write_line(&format!(
+                "t={}s capture created {w}x{h} hdr={} sampling={sampling:?}",
+                stats_started.elapsed().as_secs(),
+                c.hdr(),
+            ));
+            // The desktop came back after an outage (standby, input switch):
+            // the monitor sat unarmed through its ~12 s sync timeout, so
+            // re-arm before the first frame lands or the frames would be
+            // ignored.
+            if *create_fails > 0 {
+                *reinit_needed = true;
+            }
+            *create_fails = 0;
+            CapturerOutcome::Ready(Box::new(c))
+        }
+        Err(CaptureError::Gpu(msg)) => {
+            // Terminal: this machine cannot run Image Sync at all. Guarded:
+            // a superseded session's failure must not kill or uncheck a
+            // newer one the user already started.
+            eprintln!("Image sync: {msg}; stopping");
+            if state.is_valid(mine) {
+                // Structured payload "<kind>;<detail>": the UI localizes the
+                // sentence around the detail.
+                events.send(format!("{ENGINE_FAILED_EVENT}image;{msg}"));
+                state.running.store(false, Ordering::SeqCst);
+            }
+            CapturerOutcome::GiveUp
+        }
+        Err(e) => {
+            *create_fails += 1;
+            let fails = *create_fails;
+            if fails == 1 || fails.is_multiple_of(10) {
+                eprintln!("Capture init failed ({e}); retrying (attempt {fails})");
+            }
+            CapturerOutcome::Wait
+        }
+    }
+}
+
+/// The decision for one arrived frame: the colors to send (average, boost,
+/// smoothing and dimming applied) and whether anything changed.
+struct FrameDecision {
+    colors: [RGBColor; 48],
+    /// False when the colors are byte-identical to what the monitor already
+    /// shows (dedup: nothing to send).
+    changed: bool,
+    /// The staleness watchdog fired: the duplication looks frozen.
+    stagnant: bool,
+}
+
+/// Finalizes one arrived frame and updates the watchdog accounting.
+/// `stale_frames` is the watchdog's consecutive-identical-frames counter and
+/// `settling` suppresses it right after a display-change recreation.
+#[allow(clippy::too_many_arguments)]
+fn handle_frame(
+    fd: &crate::capture::FrameData,
+    params: &ImageSyncParams,
+    brightness: &AtomicU8,
+    last_sent: Option<&[RGBColor; 48]>,
+    stale_frames: &mut u32,
+    settling: bool,
+    prev: &mut [[u8; 3]; 48],
+    first_frame: &mut bool,
+) -> FrameDecision {
+    let mut colors = sampling::finalize(
+        &fd.sums,
+        &fd.counts,
+        prev,
+        first_frame,
+        params.smoothing,
+        params.boost,
+    );
+    // Software dimming: the device sits at max brightness during sync and
+    // the level is applied here, so changing it never stops the sync.
+    let lvl = brightness.load(Ordering::Relaxed);
+    if lvl < SYNC_BRIGHTNESS {
+        for c in colors.iter_mut() {
+            c.r = (c.r as u32 * lvl as u32 / SYNC_BRIGHTNESS as u32) as u8;
+            c.g = (c.g as u32 * lvl as u32 / SYNC_BRIGHTNESS as u32) as u8;
+            c.b = (c.b as u32 * lvl as u32 / SYNC_BRIGHTNESS as u32) as u8;
+        }
+    }
+    let same = last_sent == Some(&colors);
+    // MPO staleness watchdog: frames keep arriving with frozen pixels while
+    // the real desktop moves on (hardware overlay planes bypass the
+    // duplicated image). Recreating the duplication restores live content; a
+    // genuinely static desktop delivers no frames, so it never fires there.
+    // Identical colors alone are NOT enough to count the frame: desktop
+    // activity outside the sampled blocks leaves them untouched while the
+    // duplication is perfectly healthy (this used to recreate a live session
+    // every few seconds). Only frames whose dirty rects overlap the sampled
+    // area count.
+    let mut stagnant = false;
+    if same {
+        if fd.dirty_hit && !settling {
+            *stale_frames += 1;
+            stagnant = *stale_frames >= STALE_FRAMES_BEFORE_RECREATE;
+        } else {
+            *stale_frames = 0;
+        }
+    } else {
+        *stale_frames = 0;
+    }
+    if stagnant {
+        *stale_frames = 0;
+    }
+    FrameDecision {
+        colors,
+        changed: !same,
+        stagnant,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn image_sync_loop(
     screen: &str,
@@ -430,7 +604,6 @@ fn image_sync_loop(
     let mut recreates = 0u64;
     let mut stale_recreates = 0u64;
     let mut srv_sum = 0u64;
-    let mut staging_sum = 0u64;
     let mut max_gpu_ms = 0.0f32;
     let mut last_hdr = false;
     // Ring of recent readback Map waits (µs) and GPU dispatch times (ms)
@@ -470,23 +643,10 @@ fn image_sync_loop(
             ));
         }
         if reinit_needed {
-            // Re-arm the device (idempotent commands); the settle mirrors
-            // run()'s init sequence.
-            for cmd in reinit_commands(VIDEO_SYNC_MODE) {
-                if !state.is_valid(mine) || tx.send(cmd).is_err() {
-                    return;
-                }
+            if !rearm(tx, state, mine, VIDEO_SYNC_MODE) {
+                return;
             }
             reinit_needed = false;
-            thread::sleep(INIT_SETTLE);
-            // Same reason as run()'s post-settle arm: the chunk count is
-            // re-asserted against a settled MCU before frames resume.
-            if !state.is_valid(mine) || tx.send(UsbCommand::ArmSync(VIDEO_SYNC_MODE)).is_err() {
-                return;
-            }
-            if !state.is_valid(mine) {
-                return;
-            }
         }
 
         // A display mode change with an unchanged DeviceName (HDR toggle,
@@ -503,50 +663,21 @@ fn image_sync_loop(
         // changes the pixel format, so caching by resolution would corrupt
         // colors.
         if capturer.is_none() {
-            let retry = !first_creation;
-            first_creation = false;
-            if retry {
-                thread::sleep(RETRY_DELAY);
-            }
-            if !state.is_valid(mine) {
-                break;
-            }
-            match Capturer::new(screen, params.sampling) {
-                Ok(c) => {
-                    let (w, h) = c.dimensions();
-                    println!("Capturing {}x{}{}", w, h, if c.hdr() { " HDR" } else { "" });
-                    stats_log.write_line(&format!(
-                        "t={}s capture created {w}x{h} hdr={} sampling={:?}",
-                        stats_started.elapsed().as_secs(),
-                        c.hdr(),
-                        params.sampling
-                    ));
-                    // The desktop came back after an outage (standby, input
-                    // switch): the monitor sat unarmed through its ~12 s sync
-                    // timeout, so re-arm before the first frame lands or the
-                    // frames would be ignored.
-                    if create_fails > 0 {
-                        reinit_needed = true;
-                    }
-                    create_fails = 0;
-                    capturer = Some(c);
-                }
-                Err(CaptureError::Gpu(msg)) => {
-                    // Terminal: this machine cannot run Image Sync at all.
-                    eprintln!("Image sync: {msg}; stopping");
-                    events.send(format!(
-                        "{ENGINE_FAILED_EVENT}Image sync unavailable: {msg}"
-                    ));
-                    state.running.store(false, Ordering::SeqCst);
-                    return;
-                }
-                Err(e) => {
-                    create_fails += 1;
-                    if create_fails == 1 || create_fails.is_multiple_of(10) {
-                        eprintln!("Capture init failed ({e}); retrying (attempt {create_fails})");
-                    }
-                    continue;
-                }
+            match ensure_capturer(
+                screen,
+                params.sampling,
+                state,
+                mine,
+                events,
+                &mut first_creation,
+                &mut create_fails,
+                &mut reinit_needed,
+                &mut stats_log,
+                &stats_started,
+            ) {
+                CapturerOutcome::Ready(c) => capturer = Some(*c),
+                CapturerOutcome::Wait => continue,
+                CapturerOutcome::GiveUp => return,
             }
         }
 
@@ -564,51 +695,20 @@ fn image_sync_loop(
                         max_gpu_ms = s.gpu_ms;
                     }
                     srv_sum += s.srv_created as u64;
-                    staging_sum += s.staging_created as u64;
                     last_hdr = s.hdr;
                 }
-                let mut colors = sampling::finalize(
-                    &fd.sums,
-                    &fd.counts,
+                let settling = settle_until.is_some_and(|t| Instant::now() < t);
+                let decision = handle_frame(
+                    &fd,
+                    &params,
+                    brightness,
+                    last_sent.as_ref(),
+                    &mut stale_frames,
+                    settling,
                     &mut prev,
                     &mut first_frame,
-                    params.smoothing,
-                    params.boost,
                 );
-                // Software dimming: the device sits at max brightness during
-                // sync and the level is applied here, so changing it never
-                // stops the sync.
-                let lvl = brightness.load(Ordering::Relaxed);
-                if lvl < SYNC_BRIGHTNESS {
-                    for c in colors.iter_mut() {
-                        c.r = (c.r as u32 * lvl as u32 / SYNC_BRIGHTNESS as u32) as u8;
-                        c.g = (c.g as u32 * lvl as u32 / SYNC_BRIGHTNESS as u32) as u8;
-                        c.b = (c.b as u32 * lvl as u32 / SYNC_BRIGHTNESS as u32) as u8;
-                    }
-                }
-                let same = last_sent.as_ref() == Some(&colors);
-                // MPO staleness watchdog: frames keep arriving with frozen
-                // pixels while the real desktop moves on (hardware overlay
-                // planes bypass the duplicated image). Recreating the
-                // duplication restores live content; a genuinely static
-                // desktop delivers no frames, so it never fires there.
-                // Identical colors alone are NOT enough to count the frame:
-                // desktop activity outside the sampled blocks leaves them
-                // untouched while the duplication is perfectly healthy (this
-                // used to recreate a live session every few seconds). Only
-                // frames whose dirty rects overlap the sampled area count.
-                if same {
-                    let settling = settle_until.is_some_and(|t| Instant::now() < t);
-                    if fd.dirty_hit && !settling {
-                        stale_frames += 1;
-                    } else {
-                        stale_frames = 0;
-                    }
-                } else {
-                    stale_frames = 0;
-                }
-                if stale_frames >= STALE_FRAMES_BEFORE_RECREATE {
-                    stale_frames = 0;
+                if decision.stagnant {
                     stale_recreates += 1;
                     eprintln!("Capture stagnant: recreating duplication");
                     recreate = true;
@@ -616,15 +716,15 @@ fn image_sync_loop(
                 // Dedup: an unchanged image produces byte-identical frames,
                 // and resending them changes nothing for the monitor. The
                 // heartbeat after this match keeps it armed during lulls.
-                if !same {
-                    last_sent = Some(colors);
+                if decision.changed {
+                    last_sent = Some(decision.colors);
                     last_send = Instant::now();
                     sends += 1;
                     // try_send: if the USB writer is stalled we drop this
                     // frame instead of ever building a backlog of stale
                     // colors.
                     if let Err(TrySendError::Full(_)) =
-                        tx.try_send(UsbCommand::SendColors(mine, colors, false))
+                        tx.try_send(UsbCommand::SendColors(mine, decision.colors, false))
                     {
                         queue_full += 1;
                     }
@@ -656,9 +756,21 @@ fn image_sync_loop(
         // Keepalive: the monitor reverts out of sync mode after ~12 s without
         // frames (measured on hardware). Whenever nothing has been sent for
         // SYNC_KEEPALIVE — static desktop, or frames deduped as identical —
-        // resend the last computed colors to keep it armed.
+        // resend the last computed colors to keep it armed. Before the FIRST
+        // frame there are no colors to resend: re-arm instead, or a session
+        // started on a desktop that never presents (full-screen reader,
+        // slideshow) silently disarms after those same ~12 s and stays dead
+        // even when content finally shows up.
         if last_send.elapsed() >= SYNC_KEEPALIVE {
-            if let Some(colors) = &last_sent {
+            if last_sent.is_none() {
+                if stats_started.elapsed() >= SYNC_KEEPALIVE {
+                    reinit_needed = true;
+                    stats_log.write_line(&format!(
+                        "t={}s reinit: no frame since arming",
+                        stats_started.elapsed().as_secs()
+                    ));
+                }
+            } else if let Some(colors) = &last_sent {
                 keepalives += 1;
                 if let Err(TrySendError::Full(_)) =
                     tx.try_send(UsbCommand::SendColors(mine, *colors, false))
@@ -688,7 +800,7 @@ fn image_sync_loop(
                 "t={elapsed}s fps={:.1} wakeups={:.1}/s dedup={:.1}% send={:.1}/s \
                  ka={keepalives} qfull={queue_full} map[p50={p50}us p95={p95}us \
                  max={map_max}us] gpu[p50={gpu_p50:.3}ms max={max_gpu_ms:.3}ms] \
-                 srv={:.2}/f stg={:.2}/f \
+                 srv={:.2}/f \
                  rec={recreates} stale={stale_recreates} hdr={} mode={:?} cap={}",
                 arrivals as f64 / elapsed as f64,
                 none_wakeups as f64 / elapsed as f64,
@@ -699,7 +811,6 @@ fn image_sync_loop(
                 },
                 sends as f64 / elapsed as f64,
                 srv_sum as f64 / frames,
-                staging_sum as f64 / frames,
                 last_hdr,
                 params.sampling,
                 params.fps,
@@ -762,11 +873,12 @@ fn audio_loop(
         Ok(mic) => mic,
         Err(e) => {
             eprintln!("Audio sync: no usable loopback capture ({e}); stopping");
-            events.send(format!(
-                "{ENGINE_FAILED_EVENT}Audio sync: audio capture unavailable ({e})"
-            ));
-            // Clear the running flag so a retry from the menu isn't swallowed.
-            state.running.store(false, Ordering::SeqCst);
+            // Guarded: a superseded session's failure must not kill a newer
+            // one (same race as the image loop's terminal error).
+            if state.is_valid(mine) {
+                events.send(format!("{ENGINE_FAILED_EVENT}audio;{e}"));
+                state.running.store(false, Ordering::SeqCst);
+            }
             return;
         }
     };
@@ -803,24 +915,13 @@ fn audio_loop(
             reinit_needed = true;
         }
         if reinit_needed {
-            for cmd in reinit_commands(AUDIO_SYNC_MODE) {
-                if !state.is_valid(mine) || tx.send(cmd).is_err() {
-                    return;
-                }
+            if !rearm(tx, state, mine, AUDIO_SYNC_MODE) {
+                return;
             }
             reinit_needed = false;
             // The monitor was just re-armed: force the next frame out even
             // if it matches what went before the outage.
             last_sent = None;
-            thread::sleep(INIT_SETTLE);
-            // Same reason as run()'s post-settle arm: the chunk count is
-            // re-asserted against a settled MCU before frames resume.
-            if !state.is_valid(mine) || tx.send(UsbCommand::ArmSync(AUDIO_SYNC_MODE)).is_err() {
-                return;
-            }
-            if !state.is_valid(mine) {
-                return;
-            }
         }
         // Software dimming: the device sits at max and the brightness level
         // scales the loudness level here, so changing it never stops the
@@ -843,12 +944,13 @@ fn audio_loop(
                         }
                         Err(e) => {
                             eprintln!("Audio sync: reopen failed ({e}); stopping");
-                            events.send(format!(
-                                "{ENGINE_FAILED_EVENT}Audio sync: audio capture unavailable ({e})"
-                            ));
-                            // Clear the running flag so a retry from the menu
-                            // isn't swallowed.
-                            state.running.store(false, Ordering::SeqCst);
+                            // Guarded: this failure can fire while the user
+                            // is already restarting the sync; a superseded
+                            // session must not kill the newer one.
+                            if state.is_valid(mine) {
+                                events.send(format!("{ENGINE_FAILED_EVENT}audio;{e}"));
+                                state.running.store(false, Ordering::SeqCst);
+                            }
                             return;
                         }
                     }

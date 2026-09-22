@@ -126,8 +126,12 @@ pub fn autostart_set(enable: bool) -> bool {
         let Ok(path) = exe.into_os_string().into_string() else {
             return false;
         };
-        let mut data = Vec::with_capacity((path.len() + 1) * 2);
-        for unit in path.encode_utf16().chain(std::iter::once(0)) {
+        // Quoted: the Run value is a command line, so an unquoted path with
+        // spaces would be split into program + arguments (or let a sibling
+        // path hijack the launch).
+        let quoted = format!("\"{path}\"");
+        let mut data = Vec::with_capacity((quoted.len() + 1) * 2);
+        for unit in quoted.encode_utf16().chain(std::iter::once(0)) {
             data.extend_from_slice(&unit.to_le_bytes());
         }
         data
