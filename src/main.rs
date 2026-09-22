@@ -21,6 +21,7 @@ mod i18n;
 mod menu;
 mod sampling;
 mod settings;
+mod stats;
 mod usb;
 mod usb_protocol;
 

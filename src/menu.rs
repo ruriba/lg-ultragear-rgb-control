@@ -1063,6 +1063,14 @@ fn redetect_screen(ui: &mut Ui) {
         .map(|o| o.name)
         .unwrap_or_default();
     if detected == ui.selected_screen {
+        // Same output, but the desktop still changed mode underneath it
+        // (HDR toggle, resolution change): the duplication may keep
+        // delivering frozen frames until the staleness watchdog catches it
+        // (~2 s of frozen LEDs). Drop it so the next frame rebuilds against
+        // the new mode; the recreate's retry pacing absorbs the transition.
+        if ui.sync == SyncActive::ImageSync {
+            ui.engine.invalidate_capturer();
+        }
         return;
     }
     ui.selected_screen = detected;

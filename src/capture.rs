@@ -190,6 +190,8 @@ pub struct FrameData {
     /// change or frozen duplication); no overlap = the identical colors are
     /// explained by activity elsewhere on the desktop.
     pub dirty_hit: bool,
+    /// Per-stage timings when the `LGTRAY_STATS` instrumentation is on.
+    pub stats: Option<crate::stats::FrameStats>,
 }
 
 #[derive(Debug)]
@@ -197,6 +199,11 @@ pub enum CaptureError {
     /// The duplication became invalid (mode change, fullscreen transition,
     /// session switch). The caller must recreate the `Capturer`.
     AccessLost,
+    /// The desktop changed mode underneath a duplication that survived it
+    /// (an HDR toggle keeps the DeviceName and rarely delivers
+    /// WM_DISPLAYCHANGE). The duplication's own descriptor reports the new
+    /// mode; the caller must recreate to match it.
+    ModeChanged,
     /// This machine cannot run Image Sync at all (GPU without Direct3D 11
     /// compute). Terminal: the session gives up instead of retrying.
     Gpu(String),
@@ -207,6 +214,7 @@ impl std::fmt::Display for CaptureError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             CaptureError::AccessLost => write!(f, "duplication access lost"),
+            CaptureError::ModeChanged => write!(f, "desktop mode changed under the duplication"),
             CaptureError::Gpu(msg) => write!(f, "{msg}"),
             CaptureError::Other(e) => write!(f, "{e}"),
         }
@@ -248,6 +256,10 @@ pub struct Capturer {
     /// Format of the duplication at creation time (log only; the shader
     /// follows the per-frame format, which MPO setups can flip mid-session).
     hdr: bool,
+    /// Creation-time desktop mode (format + dimensions). A per-frame
+    /// `duplication.GetDesc()` mismatch means the desktop changed mode
+    /// under a duplication that survived it.
+    creation_format: windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT,
     width: usize,
     height: usize,
     blocks: [(u16, u16, u16, u16); 48],
@@ -339,6 +351,7 @@ impl Capturer {
                 duplication,
                 frame_held: false,
                 hdr,
+                creation_format: format,
                 width: dup_desc.ModeDesc.Width as usize,
                 height: dup_desc.ModeDesc.Height as usize,
                 blocks,
@@ -372,6 +385,21 @@ impl Capturer {
     /// * `Ok(None)` — timeout, desktop unchanged; call again.
     /// * `Err(AccessLost)` — drop this `Capturer` and build a new one.
     pub fn frame(&mut self, timeout_ms: u32) -> Result<Option<FrameData>, CaptureError> {
+        let mut stats = crate::stats::enabled().then(crate::stats::FrameStats::default);
+        // A desktop mode change with a surviving duplication (an HDR toggle
+        // keeps the DeviceName and does not deliver WM_DISPLAYCHANGE for
+        // format-only changes) leaves this duplication reporting the new
+        // mode while it delivers frozen frames in the stale one — until the
+        // staleness watchdog would catch it ~2 s later. The descriptor read
+        // is a cheap property getter; one per frame is noise.
+        // SAFETY: plain COM property read on the duplication object.
+        let dup_desc: DXGI_OUTDUPL_DESC = unsafe { self.duplication.GetDesc() };
+        if dup_desc.ModeDesc.Width as usize != self.width
+            || dup_desc.ModeDesc.Height as usize != self.height
+            || dup_desc.ModeDesc.Format != self.creation_format
+        {
+            return Err(CaptureError::ModeChanged);
+        }
         if self.frame_held {
             // SAFETY: the duplication object outlives the held-frame flag.
             unsafe {
@@ -380,6 +408,7 @@ impl Capturer {
             self.frame_held = false;
         }
         unsafe {
+            let t_acquire = crate::stats::Stage::start(stats.is_some());
             let mut info = DXGI_OUTDUPL_FRAME_INFO::default();
             let mut resource: Option<IDXGIResource> = None;
             if let Err(e) = self
@@ -393,6 +422,9 @@ impl Capturer {
                 };
             }
             self.frame_held = true;
+            if let Some(s) = stats.as_mut() {
+                s.acquire_us = t_acquire.us();
+            }
             // Cursor-only metadata frame: the desktop image did not change.
             // Side effect: the pointer itself no longer lights up the LEDs.
             if info.LastPresentTime == 0 {
@@ -402,6 +434,7 @@ impl Capturer {
             }
             let resource = resource
                 .ok_or_else(|| CaptureError::Other(io::Error::other("frame without resource")))?;
+            let t_dirty = crate::stats::Stage::start(stats.is_some());
             // The frame's dirty rects (where the desktop really changed) are
             // only readable while it is held. Conservative default: on any
             // query failure assume the sampled area was touched, so the
@@ -437,6 +470,9 @@ impl Capturer {
                 }
                 Err(_) => self.dirty_buf.clear(),
             }
+            if let Some(s) = stats.as_mut() {
+                s.dirty_us = t_dirty.us();
+            }
 
             let frame_tex: ID3D11Texture2D = resource
                 .cast()
@@ -444,14 +480,13 @@ impl Capturer {
             // Per-frame format sync: on MPO setups the driver can flip the
             // delivered format between FP16 and BGRA8 even while the
             // duplication descriptor keeps reporting the desktop format.
-            // The frame texture's own descriptor is the truth.
+            // The frame texture's own descriptor is the truth, and is passed
+            // straight through to the compute path.
             let mut desc = D3D11_TEXTURE2D_DESC::default();
             frame_tex.GetDesc(&mut desc);
-            let frame_hdr = desc.Format
-                == windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_R16G16B16A16_FLOAT;
             let sums = self
                 .compute
-                .avg(&frame_tex, frame_hdr)
+                .avg(&frame_tex, desc.Format, stats.as_mut())
                 .map_err(|e| CaptureError::Other(io::Error::other(e)))?;
             let counts = self.compute.counts();
             // The readback Map blocked until the dispatch executed, so the
@@ -462,6 +497,7 @@ impl Capturer {
                 sums,
                 counts,
                 dirty_hit,
+                stats,
             }))
         }
     }

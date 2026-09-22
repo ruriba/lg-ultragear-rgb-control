@@ -54,6 +54,14 @@ const INIT_SETTLE: Duration = Duration::from_millis(250);
 /// colors (~2 s at 30 fps). A genuinely static desktop delivers no frames at
 /// all, so it never triggers this.
 const STALE_FRAMES_BEFORE_RECREATE: u32 = 60;
+/// Grace window after a display-change recreation: a desktop mode
+/// transition (HDR toggle, resolution change) keeps even freshly rebuilt
+/// duplications delivering frozen frames for several seconds while DWM and
+/// the monitor settle (measured: the HDR-enable ramp churns for ~10-20 s),
+/// and the watchdog would otherwise recreate through it. Staleness counting
+/// pauses for this long after the recreate; the steady-state watchdog is
+/// unaffected.
+const DISPLAY_CHANGE_SETTLE: Duration = Duration::from_secs(12);
 
 /// UserEvent prefix carrying the reason an engine gave up on its own: the UI
 /// unchecks the sync toggle and surfaces the reason in the status item.
@@ -104,6 +112,11 @@ impl Default for ImageSyncParams {
 pub struct EngineState {
     running: AtomicBool,
     session: AtomicU64,
+    /// Set on a display mode/topology change with an unchanged DeviceName
+    /// (e.g. an HDR toggle): the image-sync loop drops its duplication so
+    /// the next iteration rebuilds it against the new mode, instead of
+    /// waiting out the staleness watchdog (~2 s of frozen LEDs).
+    display_changed: AtomicBool,
 }
 
 impl EngineState {
@@ -130,6 +143,7 @@ impl Engine {
             state: Arc::new(EngineState {
                 running: AtomicBool::new(false),
                 session: AtomicU64::new(0),
+                display_changed: AtomicBool::new(false),
             }),
             tx,
             image_params: Arc::new(Mutex::new(ImageSyncParams::default())),
@@ -215,6 +229,17 @@ impl Engine {
         for cmd in reinit_commands(mode) {
             self.send(cmd);
         }
+    }
+
+    /// Drops the running session's duplication at the next frame: the
+    /// desktop changed mode underneath it (WM_DISPLAYCHANGE with an
+    /// unchanged DeviceName — HDR toggle, resolution change) and the
+    /// duplication may keep delivering frozen frames in the stale format
+    /// until the staleness watchdog would catch it (~2 s of frozen LEDs).
+    /// The recreate keeps its 500 ms retry pacing, so this stays safe while
+    /// the display transition is still in progress.
+    pub fn invalidate_capturer(&self) {
+        self.state.display_changed.store(true, Ordering::SeqCst);
     }
 }
 
@@ -368,6 +393,33 @@ fn image_sync_loop(
     let mut last_send = Instant::now();
     // Consecutive arrived frames with identical colors (staleness watchdog).
     let mut stale_frames = 0u32;
+    // Watchdog suppression window after a display-change recreation.
+    let mut settle_until: Option<Instant> = None;
+    // Instrumentation (LGTRAY_STATS): counters for the periodic aggregate
+    // line. The adds run unconditionally (immeasurable at 30 Hz); only the
+    // stage timers in capture/compute and the file writes are gated.
+    let mut stats_log = crate::stats::StatsLog::open();
+    stats_log.write_line("t=0s session start image_sync");
+    let stats_started = Instant::now();
+    let mut stats_flushed = Instant::now();
+    let mut arrivals = 0u64;
+    let mut none_wakeups = 0u64;
+    let mut dedup_skips = 0u64;
+    let mut sends = 0u64;
+    let mut keepalives = 0u64;
+    let mut queue_full = 0u64;
+    let mut recreates = 0u64;
+    let mut stale_recreates = 0u64;
+    let mut srv_sum = 0u64;
+    let mut staging_sum = 0u64;
+    let mut max_gpu_ms = 0.0f32;
+    let mut last_hdr = false;
+    // Ring of recent readback Map waits (µs) and GPU dispatch times (ms)
+    // for percentiles.
+    let mut map_ring = [0u32; 128];
+    let mut gpu_ring = [0f32; 128];
+    let mut ring_i = 0usize;
+    let mut ring_n = 0usize;
 
     loop {
         if !state.is_valid(mine) {
@@ -403,6 +455,15 @@ fn image_sync_loop(
             }
         }
 
+        // A display mode change with an unchanged DeviceName (HDR toggle,
+        // resolution change) leaves the duplication delivering frozen
+        // frames; drop it immediately instead of waiting out the staleness
+        // watchdog (~2 s). The recreate path below applies its retry pacing.
+        if state.display_changed.swap(false, Ordering::SeqCst) {
+            capturer = None;
+            settle_until = Some(Instant::now() + DISPLAY_CHANGE_SETTLE);
+        }
+
         // (Re)create the duplication. Format and blocks are re-derived on
         // every (re)creation: a Windows HDR toggle keeps the resolution but
         // changes the pixel format, so caching by resolution would corrupt
@@ -420,6 +481,12 @@ fn image_sync_loop(
                 Ok(c) => {
                     let (w, h) = c.dimensions();
                     println!("Capturing {}x{}{}", w, h, if c.hdr() { " HDR" } else { "" });
+                    stats_log.write_line(&format!(
+                        "t={}s capture created {w}x{h} hdr={} sampling={:?}",
+                        stats_started.elapsed().as_secs(),
+                        c.hdr(),
+                        params.sampling
+                    ));
                     // The desktop came back after an outage (standby, input
                     // switch): the monitor sat unarmed through its ~12 s sync
                     // timeout, so re-arm before the first frame lands or the
@@ -453,6 +520,19 @@ fn image_sync_loop(
         let mut recreate = false;
         match capturer.as_mut().unwrap().frame(ACQUIRE_TIMEOUT_MS) {
             Ok(Some(fd)) => {
+                arrivals += 1;
+                if let Some(s) = &fd.stats {
+                    map_ring[ring_i] = s.map_wait_us;
+                    gpu_ring[ring_i] = s.gpu_ms;
+                    ring_i = (ring_i + 1) % map_ring.len();
+                    ring_n = (ring_n + 1).min(map_ring.len());
+                    if s.gpu_ms > max_gpu_ms {
+                        max_gpu_ms = s.gpu_ms;
+                    }
+                    srv_sum += s.srv_created as u64;
+                    staging_sum += s.staging_created as u64;
+                    last_hdr = s.hdr;
+                }
                 let mut colors = sampling::finalize(
                     &fd.sums,
                     &fd.counts,
@@ -484,7 +564,8 @@ fn image_sync_loop(
                 // used to recreate a live session every few seconds). Only
                 // frames whose dirty rects overlap the sampled area count.
                 if same {
-                    if fd.dirty_hit {
+                    let settling = settle_until.is_some_and(|t| Instant::now() < t);
+                    if fd.dirty_hit && !settling {
                         stale_frames += 1;
                     } else {
                         stale_frames = 0;
@@ -494,6 +575,7 @@ fn image_sync_loop(
                 }
                 if stale_frames >= STALE_FRAMES_BEFORE_RECREATE {
                     stale_frames = 0;
+                    stale_recreates += 1;
                     eprintln!("Capture stagnant: recreating duplication");
                     recreate = true;
                 }
@@ -503,20 +585,36 @@ fn image_sync_loop(
                 if !same {
                     last_sent = Some(colors);
                     last_send = Instant::now();
+                    sends += 1;
                     // try_send: if the USB writer is stalled we drop this
                     // frame instead of ever building a backlog of stale
                     // colors.
-                    let _ = tx.try_send(UsbCommand::SendColors(mine, colors, false));
+                    if let Err(TrySendError::Full(_)) =
+                        tx.try_send(UsbCommand::SendColors(mine, colors, false))
+                    {
+                        queue_full += 1;
+                    }
+                } else {
+                    dedup_skips += 1;
                 }
             }
-            Ok(None) => {}
+            Ok(None) => none_wakeups += 1,
             Err(CaptureError::AccessLost) => recreate = true,
+            Err(CaptureError::ModeChanged) => {
+                // The duplication itself reported the new desktop mode:
+                // recreate now, and give the transition the same watchdog
+                // grace as a display-change recreate — DWM keeps delivering
+                // frozen frames for a few seconds while it settles.
+                recreate = true;
+                settle_until = Some(Instant::now() + DISPLAY_CHANGE_SETTLE);
+            }
             Err(e) => {
                 eprintln!("Capture error ({e}); recreating...");
                 recreate = true;
             }
         }
         if recreate {
+            recreates += 1;
             capturer = None;
             continue;
         }
@@ -527,7 +625,12 @@ fn image_sync_loop(
         // resend the last computed colors to keep it armed.
         if last_send.elapsed() >= SYNC_KEEPALIVE {
             if let Some(colors) = &last_sent {
-                let _ = tx.try_send(UsbCommand::SendColors(mine, *colors, false));
+                keepalives += 1;
+                if let Err(TrySendError::Full(_)) =
+                    tx.try_send(UsbCommand::SendColors(mine, *colors, false))
+                {
+                    queue_full += 1;
+                }
             }
             last_send = Instant::now();
         }
@@ -538,7 +641,58 @@ fn image_sync_loop(
         if let Some(rest) = frame_ms.checked_sub(start.elapsed()) {
             thread::sleep(rest);
         }
+
+        // Periodic aggregate line for the LGTRAY_STATS log (release builds
+        // have no console, so this is the only observable trace).
+        if stats_log.is_open() && stats_flushed.elapsed() >= Duration::from_secs(5) {
+            stats_flushed = Instant::now();
+            let elapsed = stats_started.elapsed().as_secs().max(1);
+            let (p50, p95, map_max) = map_percentiles(&map_ring, ring_n);
+            let gpu_p50 = gpu_percentile(&gpu_ring, ring_n);
+            let frames = arrivals.max(1) as f64;
+            stats_log.write_line(&format!(
+                "t={elapsed}s fps={:.1} wakeups={:.1}/s dedup={:.1}% send={:.1}/s \
+                 ka={keepalives} qfull={queue_full} map[p50={p50}us p95={p95}us \
+                 max={map_max}us] gpu[p50={gpu_p50:.3}ms max={max_gpu_ms:.3}ms] \
+                 srv={:.2}/f stg={:.2}/f \
+                 rec={recreates} stale={stale_recreates} hdr={} mode={:?} cap={}",
+                arrivals as f64 / elapsed as f64,
+                none_wakeups as f64 / elapsed as f64,
+                if arrivals > 0 {
+                    dedup_skips as f64 / arrivals as f64 * 100.0
+                } else {
+                    0.0
+                },
+                sends as f64 / elapsed as f64,
+                srv_sum as f64 / frames,
+                staging_sum as f64 / frames,
+                last_hdr,
+                params.sampling,
+                params.fps,
+            ));
+        }
     }
+}
+
+/// p50/p95/max over the valid prefix of the map-wait ring buffer.
+fn map_percentiles(ring: &[u32; 128], n: usize) -> (u32, u32, u32) {
+    if n == 0 {
+        return (0, 0, 0);
+    }
+    let mut sorted = ring[..n].to_vec();
+    sorted.sort_unstable();
+    let at = |p: usize| sorted[(n - 1) * p / 100];
+    (at(50), at(95), sorted[n - 1])
+}
+
+/// p50 of the GPU dispatch times, ignoring NaN (failed query) samples.
+fn gpu_percentile(ring: &[f32; 128], n: usize) -> f32 {
+    let mut valid: Vec<f32> = ring[..n].iter().filter(|v| !v.is_nan()).copied().collect();
+    if valid.is_empty() {
+        return f32::NAN;
+    }
+    valid.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    valid[valid.len() * 50 / 100]
 }
 
 /// as 0xC2 audio-sync frames, with the base palette (rainbow sweep or one
