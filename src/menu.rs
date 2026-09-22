@@ -430,7 +430,11 @@ pub fn build_ui(
     // (hard power cut, monitor waking from standby): the delayed pass
     // re-asserts the state if the burst above landed on a deaf device. If
     // the monitor is not there yet, its (re)connection event schedules the
-    // pass instead.
+    // pass instead. (Gated on `connected`: firing it unconditionally
+    // re-armed healthy sessions ~1 s into their first frames and the mode
+    // switch blanked the whole strip. The engine's init re-asserts the
+    // frame-chunk count after its settle instead, which covers the same
+    // window without a visible blank.)
     if ui.connected.load(Ordering::SeqCst) {
         schedule_recovery_repeat(&ui);
     }
@@ -1092,9 +1096,9 @@ fn redetect_screen(ui: &mut Ui) {
             start_sync(ui, SyncActive::ImageSync);
         }
         SyncActive::Audio => {
-            // No screen dependency: re-asserting the armed audio mode on the
-            // freshly reset MCU is enough.
-            ui.engine.reassert_sync(AUDIO_SYNC_MODE);
+            // No screen dependency: a controlled reinit of the running audio
+            // session re-arms the freshly reset MCU.
+            ui.engine.request_reinit();
         }
         SyncActive::None => recover_monitor(ui),
     }
@@ -1111,8 +1115,11 @@ fn redetect_screen(ui: &mut Ui) {
 /// power event win.
 fn recover_monitor(ui: &mut Ui) {
     match ui.sync {
-        SyncActive::ImageSync => ui.engine.reassert_sync(VIDEO_SYNC_MODE),
-        SyncActive::Audio => ui.engine.reassert_sync(AUDIO_SYNC_MODE),
+        // A controlled engine reinit (frames pause around the re-arm): an
+        // out-of-band mode switch landing between two reports of a frame
+        // leaves the monitor's parser applying only the first chunk.
+        SyncActive::ImageSync => ui.engine.request_reinit(),
+        SyncActive::Audio => ui.engine.request_reinit(),
         SyncActive::None => {
             // A sync pending from app start (its screen was not up yet)
             // takes precedence over the static restore, once the monitor's
@@ -1204,6 +1211,8 @@ fn apply_command_state(ui: &mut Ui, cmd: &UsbCommand) {
     match cmd {
         UsbCommand::SetBrightness(level) => ui.brightness = Some(*level),
         UsbCommand::SetMode(mode) => ui.mode = Some(*mode),
+        // Pure protocol bookkeeping: no UI state behind it.
+        UsbCommand::ArmSync(_) => {}
         UsbCommand::SetStaticColor(slot, r, g, b) => {
             let idx = (*slot as usize).saturating_sub(1);
             if let Some(c) = ui.slot_colors.get_mut(idx) {

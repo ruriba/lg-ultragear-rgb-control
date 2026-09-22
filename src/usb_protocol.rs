@@ -36,16 +36,20 @@ pub fn send_payload(device: &HidDevice, payload: &[u8]) -> bool {
     packet[2..2 + payload.len()].copy_from_slice(payload);
     packet[2 + payload.len()..total].copy_from_slice(&TERMINATOR);
 
-    let mut ok = true;
     let mut report = [0u8; 65]; // Report ID 0 + 64 bytes
-    for chunk in packet[..padded].chunks(64) {
+    for (i, chunk) in packet[..padded].chunks(64).enumerate() {
         report[1..1 + chunk.len()].copy_from_slice(chunk);
         if let Err(e) = device.write(&report[..1 + chunk.len()]) {
-            eprintln!("USB write error: {}", e);
-            ok = false;
+            // Abort the rest of the frame: the monitor counts the reports of
+            // a sync frame (the 0xCA arm command sets the count), so skipping
+            // the remaining chunks keeps the stream aligned at the next
+            // frame's first report. Pushing them through would make every
+            // following frame assemble from mismatched chunks.
+            eprintln!("USB write error in chunk {i}: {}", e);
+            return false;
         }
     }
-    ok
+    true
 }
 
 pub fn turn_on(device: &HidDevice) -> bool {
@@ -65,9 +69,18 @@ pub fn set_brightness(device: &HidDevice, level: u8) -> bool {
 pub fn set_mode(device: &HidDevice, mode: u8) -> bool {
     let ok = send_payload(device, &[0xC7, 0x02, 0x02, 0x00, mode, mode ^ 0xD7]);
     if mode == 7 || mode == 8 {
-        return ok && send_payload(device, &[0xCA, 0x02, 0x02, 0x03, mode, mode ^ 0xD9]);
+        return ok && arm_sync(device, mode);
     }
     ok
+}
+
+/// The chunk-count arm command alone (no mode switch): (re-)asserts how many
+/// HID reports make up one sync frame. Re-sent after the arming settle so
+/// the count is established against a quiet MCU right before the first
+/// frame — a count swallowed while the MCU was still switching modes leaves
+/// every frame applied partially.
+pub fn arm_sync(device: &HidDevice, mode: u8) -> bool {
+    send_payload(device, &[0xCA, 0x02, 0x02, 0x03, mode, mode ^ 0xD9])
 }
 
 /// Writes a static color into one of the 4 slots, then switches to that slot's

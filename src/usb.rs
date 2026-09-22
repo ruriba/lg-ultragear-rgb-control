@@ -49,6 +49,9 @@ pub enum UsbCommand {
     TurnOff,
     SetBrightness(u8),
     SetMode(u8),
+    /// Chunk-count arm command alone (no mode switch): re-asserted after the
+    /// arming settle, right before frames resume.
+    ArmSync(u8),
     SetStaticColor(u8, u8, u8, u8),
     /// Stores a slot color WITHOUT switching modes: startup restore of the
     /// saved palette (SetStaticColor deliberately switches to the slot).
@@ -148,6 +151,7 @@ fn usb_loop(rx: Receiver<UsbCommand>, connected: &AtomicBool, events: &Events) {
                 UsbCommand::TurnOff => "TurnOff".into(),
                 UsbCommand::SetBrightness(l) => format!("Brightness({l})"),
                 UsbCommand::SetMode(m) => format!("SetMode({m})"),
+                UsbCommand::ArmSync(m) => format!("ArmSync({m})"),
                 UsbCommand::SetStaticColor(..) => "SetStaticColor".into(),
                 UsbCommand::StoreStaticColor(s, r, g, b) => {
                     format!("Store{s}({r:02x}{g:02x}{b:02x})")
@@ -179,6 +183,7 @@ fn execute(cmd: &UsbCommand, dev: &HidDevice, active_session: u64) -> bool {
         UsbCommand::TurnOff => usb_protocol::turn_off(dev),
         UsbCommand::SetBrightness(level) => usb_protocol::set_brightness(dev, *level),
         UsbCommand::SetMode(mode) => usb_protocol::set_mode(dev, *mode),
+        UsbCommand::ArmSync(mode) => usb_protocol::arm_sync(dev, *mode),
         UsbCommand::SetStaticColor(slot, r, g, b) => {
             usb_protocol::set_static_color(dev, *slot, *r, *g, *b)
         }

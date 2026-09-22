@@ -117,6 +117,13 @@ pub struct EngineState {
     /// the next iteration rebuilds it against the new mode, instead of
     /// waiting out the staleness watchdog (~2 s of frozen LEDs).
     display_changed: AtomicBool,
+    /// Set when a recovery pass asks the running session to re-arm the
+    /// device: both loops consume it as a controlled reinit (frames pause,
+    /// init is re-sent, INIT_SETTLE passes, frames resume). Re-arming
+    /// out-of-band while a frame's reports are in flight can leave the
+    /// monitor's frame parser misaligned — only the first chunk of each
+    /// frame gets applied.
+    reinit_requested: AtomicBool,
 }
 
 impl EngineState {
@@ -144,6 +151,7 @@ impl Engine {
                 running: AtomicBool::new(false),
                 session: AtomicU64::new(0),
                 display_changed: AtomicBool::new(false),
+                reinit_requested: AtomicBool::new(false),
             }),
             tx,
             image_params: Arc::new(Mutex::new(ImageSyncParams::default())),
@@ -220,15 +228,16 @@ impl Engine {
         self.state.running.store(false, Ordering::SeqCst);
     }
 
-    /// Re-sends the session init minus SetSession (still active): on, sync
-    /// brightness, armed mode. Idempotent re-assertion for monitor-side power
-    /// resets the running session never observed: the lighting MCU boots into
-    /// its factory state (Static 4, blue) with no HID notification, and when
-    /// the USB enumeration survives the outage nothing else re-arms it.
-    pub fn reassert_sync(&self, mode: u8) {
-        for cmd in reinit_commands(mode) {
-            self.send(cmd);
-        }
+    /// Asks the running session to re-arm the device through its own
+    /// controlled path: frames pause, the init sequence is re-sent, one
+    /// INIT_SETTLE passes, frames resume. Used by the recovery passes for
+    /// monitor-side power resets the running session never observed (the
+    /// lighting MCU boots into its factory state with no HID notification).
+    /// The re-arm must never go out-of-band while frames flow: a mode switch
+    /// landing between two reports of a frame can leave the monitor's frame
+    /// parser applying only the first chunk of every frame.
+    pub fn request_reinit(&self) {
+        self.state.reinit_requested.store(true, Ordering::SeqCst);
     }
 
     /// Drops the running session's duplication at the next frame: the
@@ -264,6 +273,9 @@ fn run(
     if !state.is_valid(mine) {
         return;
     }
+    // A reinit request left over by a previous session's recovery pass means
+    // nothing to this one: the init below re-arms from scratch anyway.
+    state.reinit_requested.store(false, Ordering::SeqCst);
     // Init sequence: on, max brightness, then the device mode the source
     // feeds. Re-validated before every send so nothing lands after the
     // user's command or the quit restore.
@@ -317,6 +329,13 @@ fn run(
         return;
     }
     thread::sleep(INIT_SETTLE);
+    // Re-assert the chunk-count arm now that the mode switch has settled:
+    // a count swallowed while the MCU was still busy switching is what
+    // leaves every sync frame applying only its first chunk. One
+    // single-report command, still before the first frame.
+    if !state.is_valid(mine) || tx.send(UsbCommand::ArmSync(mode)).is_err() {
+        return;
+    }
 
     match source {
         Source::ImageSync { screen } => image_sync_loop(
@@ -440,6 +459,16 @@ fn image_sync_loop(
             thread::sleep(DISCONNECTED_IDLE);
             continue;
         }
+        // A recovery pass asked for a re-arm: route it through this
+        // controlled path (frames pause around the init) instead of ever
+        // switching modes while a frame's reports are in flight.
+        if state.reinit_requested.swap(false, Ordering::SeqCst) {
+            reinit_needed = true;
+            stats_log.write_line(&format!(
+                "t={}s reinit requested by recovery pass",
+                stats_started.elapsed().as_secs()
+            ));
+        }
         if reinit_needed {
             // Re-arm the device (idempotent commands); the settle mirrors
             // run()'s init sequence.
@@ -450,6 +479,11 @@ fn image_sync_loop(
             }
             reinit_needed = false;
             thread::sleep(INIT_SETTLE);
+            // Same reason as run()'s post-settle arm: the chunk count is
+            // re-asserted against a settled MCU before frames resume.
+            if !state.is_valid(mine) || tx.send(UsbCommand::ArmSync(VIDEO_SYNC_MODE)).is_err() {
+                return;
+            }
             if !state.is_valid(mine) {
                 return;
             }
@@ -763,6 +797,11 @@ fn audio_loop(
             thread::sleep(DISCONNECTED_IDLE);
             continue;
         }
+        // Same recovery-pass contract as the image loop: re-arm through the
+        // controlled pause, never mid-stream.
+        if state.reinit_requested.swap(false, Ordering::SeqCst) {
+            reinit_needed = true;
+        }
         if reinit_needed {
             for cmd in reinit_commands(AUDIO_SYNC_MODE) {
                 if !state.is_valid(mine) || tx.send(cmd).is_err() {
@@ -774,6 +813,11 @@ fn audio_loop(
             // if it matches what went before the outage.
             last_sent = None;
             thread::sleep(INIT_SETTLE);
+            // Same reason as run()'s post-settle arm: the chunk count is
+            // re-asserted against a settled MCU before frames resume.
+            if !state.is_valid(mine) || tx.send(UsbCommand::ArmSync(AUDIO_SYNC_MODE)).is_err() {
+                return;
+            }
             if !state.is_valid(mine) {
                 return;
             }
