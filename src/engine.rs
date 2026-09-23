@@ -74,13 +74,9 @@ pub enum Source {
     /// the engine's shared params slot, so preset changes apply without
     /// restart.
     ImageSync { screen: String },
-    /// Loudness-reactive gradient (device audio-sync mode).
-    Audio {
-        gain: f32,
-        color: AudioColor,
-        blink: Blink,
-        range: DynamicRange,
-    },
+    /// Loudness-reactive gradient (device audio-sync mode). Tuning likewise
+    /// read live from the engine's audio params slot.
+    Audio,
 }
 
 /// Image Sync tuning, carried from the menu to the sampler.
@@ -103,6 +99,33 @@ impl Default for ImageSyncParams {
             smoothing: 0.4,
             boost: 1.2,
             fps: 30,
+        }
+    }
+}
+
+/// Audio Sync tuning, carried from the menu to the loudness loop. Read live
+/// from the engine's shared slot every cycle (~30 fps), so preset changes
+/// apply without restarting the engine — a restart used to be the only way
+/// these reached the loop, at the cost of a ~1 s LED gap.
+#[derive(Clone, Copy, PartialEq)]
+pub struct AudioParams {
+    /// Loudness → intensity multiplier.
+    pub gain: f32,
+    /// What the strip paints: rainbow sweep or one solid color.
+    pub color: AudioColor,
+    /// Temporal envelope of the response.
+    pub blink: Blink,
+    /// Loudness → level curve.
+    pub range: DynamicRange,
+}
+
+impl Default for AudioParams {
+    fn default() -> Self {
+        Self {
+            gain: 1.0,
+            color: AudioColor::Rainbow,
+            blink: Blink::Normal,
+            range: DynamicRange::Normal,
         }
     }
 }
@@ -137,6 +160,7 @@ pub struct Engine {
     state: Arc<EngineState>,
     tx: SyncSender<UsbCommand>,
     image_params: Arc<Mutex<ImageSyncParams>>,
+    audio_params: Arc<Mutex<AudioParams>>,
     /// Brightness level 1..=12, applied by the engine as software dimming.
     brightness: Arc<AtomicU8>,
     /// Monitor HID presence, published by the USB worker. The engine idles
@@ -156,6 +180,7 @@ impl Engine {
             }),
             tx,
             image_params: Arc::new(Mutex::new(ImageSyncParams::default())),
+            audio_params: Arc::new(Mutex::new(AudioParams::default())),
             brightness: Arc::new(AtomicU8::new(SYNC_BRIGHTNESS)),
             connected,
             events,
@@ -167,6 +192,12 @@ impl Engine {
     /// still require a restart.
     pub fn set_image_params(&self, params: ImageSyncParams) {
         *self.image_params.lock().unwrap() = params;
+    }
+
+    /// Live-updates audio sync tuning: the running loop reads the slot every
+    /// cycle, so preset changes apply without a restart.
+    pub fn set_audio_params(&self, params: AudioParams) {
+        *self.audio_params.lock().unwrap() = params;
     }
 
     /// Brightness level 1..=12. During sync it is applied as software
@@ -210,6 +241,7 @@ impl Engine {
         let state = self.state.clone();
         let tx = self.tx.clone();
         let image_params = self.image_params.clone();
+        let audio_params = self.audio_params.clone();
         let brightness = self.brightness.clone();
         let connected = self.connected.clone();
         let events = self.events;
@@ -218,6 +250,7 @@ impl Engine {
                 source,
                 tx,
                 image_params,
+                audio_params,
                 brightness,
                 events,
                 connected,
@@ -268,6 +301,7 @@ fn run(
     source: Source,
     tx: SyncSender<UsbCommand>,
     image_params: Arc<Mutex<ImageSyncParams>>,
+    audio_params: Arc<Mutex<AudioParams>>,
     brightness: Arc<AtomicU8>,
     events: Events,
     connected: Arc<AtomicBool>,
@@ -292,7 +326,7 @@ fn run(
     // user's command or the quit restore.
     let mode = match &source {
         Source::ImageSync { .. } => VIDEO_SYNC_MODE,
-        Source::Audio { .. } => AUDIO_SYNC_MODE,
+        Source::Audio => AUDIO_SYNC_MODE,
     };
     match &source {
         Source::ImageSync { .. } => {
@@ -309,15 +343,11 @@ fn run(
                 p.boost
             );
         }
-        Source::Audio {
-            gain,
-            color,
-            blink,
-            range,
-        } => {
+        Source::Audio => {
+            let p = *audio_params.lock().unwrap();
             println!(
                 "Engine started (audio sync, gain {:.1}, color {:?}, blink {:?}, range {:?})",
-                gain, color, blink, range
+                p.gain, p.color, p.blink, p.range
             );
         }
     }
@@ -359,16 +389,8 @@ fn run(
             &state,
             mine,
         ),
-        Source::Audio {
-            gain,
-            color,
-            blink,
-            range,
-        } => audio_loop(
-            gain,
-            color,
-            blink,
-            range,
+        Source::Audio => audio_loop(
+            &audio_params,
             &tx,
             &brightness,
             &events,
@@ -916,24 +938,10 @@ fn gpu_percentile(ring: &[f32; 128], n: usize) -> f32 {
     valid[valid.len() * 50 / 100]
 }
 
-/// as 0xC2 audio-sync frames, with the base palette (rainbow sweep or one
-/// solid color) scaled every frame by the smoothed loudness of the system
-/// audio (the monitor has no DSP of its own — LG's original software feeds it
-/// exactly like this from the PC side).
-#[allow(clippy::too_many_arguments)] // the Source::Audio fields + loop plumbing
-fn audio_loop(
-    gain: f32,
-    color: AudioColor,
-    blink: Blink,
-    range: DynamicRange,
-    tx: &SyncSender<UsbCommand>,
-    brightness: &AtomicU8,
-    events: &Events,
-    connected: &AtomicBool,
-    state: &EngineState,
-    mine: u64,
-) {
-    let base: [RGBColor; 48] = match color {
+/// The strip's base palette for a color setting: a rainbow hue sweep across
+/// the 48 LEDs, or the solid color on every LED.
+fn audio_base(color: AudioColor) -> [RGBColor; 48] {
+    match color {
         AudioColor::Rainbow => {
             std::array::from_fn(|i| sampling::hsl_to_rgb(i as f32 / 48.0, 1.0, 0.5))
         }
@@ -944,7 +952,30 @@ fn audio_loop(
                 b: rgb[2],
             }; 48]
         }
-    };
+    }
+}
+
+/// as 0xC2 audio-sync frames, with the base palette (rainbow sweep or one
+/// solid color) scaled every frame by the smoothed loudness of the system
+/// audio (the monitor has no DSP of its own — LG's original software feeds it
+/// exactly like this from the PC side). Tuning is re-read from the shared
+/// slot every cycle, so menu changes apply live.
+#[allow(clippy::too_many_arguments)] // the loop plumbing
+fn audio_loop(
+    audio_params: &Mutex<AudioParams>,
+    tx: &SyncSender<UsbCommand>,
+    brightness: &AtomicU8,
+    events: &Events,
+    connected: &AtomicBool,
+    state: &EngineState,
+    mine: u64,
+) {
+    // Tuning snapshot + the base palette derived from it. The palette is
+    // recomputed only when the color setting actually changes (a rare menu
+    // event), not every cycle.
+    let params = *audio_params.lock().unwrap();
+    let mut base_color = params.color;
+    let mut base = audio_base(base_color);
     let mut mic = match audio::LoopbackLoudness::open() {
         Ok(mic) => mic,
         Err(e) => {
@@ -977,6 +1008,13 @@ fn audio_loop(
         if !state.is_valid(mine) {
             break;
         }
+        // Tuning re-read every cycle: menu changes apply live, with no
+        // restart and no LED gap.
+        let params = *audio_params.lock().unwrap();
+        if params.color != base_color {
+            base_color = params.color;
+            base = audio_base(base_color);
+        }
         // Monitor absent: skip painting (the USB worker would discard the
         // frames). The loopback is left undrained — at most 200 ms of audio
         // buffers up device-side, and reconnect resumes from fresh sound.
@@ -1003,7 +1041,7 @@ fn audio_loop(
         // scales the loudness level here, so changing it never stops the
         // sync.
         let dim = brightness.load(Ordering::Relaxed) as f32 / SYNC_BRIGHTNESS as f32;
-        let level = match mic.next_level(gain, blink, range) {
+        let level = match mic.next_level(params.gain, params.blink, params.range) {
             Some(level) => {
                 failures = 0;
                 level * dim
@@ -1226,6 +1264,18 @@ mod tests {
         // 0.9*100 + 0.1*200 = 110.
         assert_eq!(b.colors[0].r, 110);
         assert!(b.changed);
+    }
+
+    #[test]
+    fn audio_base_matches_the_color_setting() {
+        let solid = audio_base(AudioColor::Solid([10, 200, 30]));
+        assert!(solid.iter().all(|&c| (c.r, c.g, c.b) == (10, 200, 30)));
+        // The rainbow sweep starts at red (hue 0) and wraps distinct hues
+        // around the ring.
+        let rainbow = audio_base(AudioColor::Rainbow);
+        assert_eq!((rainbow[0].r, rainbow[0].g, rainbow[0].b), (255, 0, 0));
+        assert_ne!(rainbow[0], rainbow[16]);
+        assert_ne!(rainbow[16], rainbow[32]);
     }
 
     #[test]

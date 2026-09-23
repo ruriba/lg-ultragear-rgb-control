@@ -3,7 +3,7 @@
 Right-click the tray icon to open the menu. Every change is applied
 immediately and persisted to `settings.json`; options marked **[restart]**
 restart the sync engine (~1 s pause in the LEDs) because they need new
-capture geometry or device arming.
+capture geometry.
 
 With the monitor absent (unplugged, standby, input switch), commands cannot
 reach it, but nothing is lost: the app remembers what you set — modes,
@@ -58,7 +58,8 @@ colors are resent every 5 s (keepalive) so the monitor stays in sync mode.
 
 The LEDs pulse with the loudness of whatever Windows is playing (loopback
 capture of the default output device — no microphone). The strip shows a
-base palette whose brightness follows the measured volume envelope.
+base palette whose brightness follows the measured volume envelope. Every
+option applies immediately while Audio Sync runs — no restart, no LED gap.
 
 - **Sensitivity ▸ Low / Medium / High** — multiplier over the measured
   loudness (0.5 / 1.0 / 2.0) before the response curve.

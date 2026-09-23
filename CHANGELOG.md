@@ -1,5 +1,14 @@
 # Changelog
 
+## v1.3.0 (2026-09-23)
+
+### Changed
+
+- Audio Sync tuning (sensitivity, color, blink, dynamic range) now applies
+  live while the sync runs, instead of restarting the engine (~1 s LED
+  pause): the parameters live in a shared slot the loop re-reads every
+  cycle, mirroring Image Sync's tuning slot.
+
 ## v1.2.0 (2026-09-23)
 
 ### Added

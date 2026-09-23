@@ -9,7 +9,8 @@
 use crate::audio::{AudioColor, Blink, DynamicRange};
 use crate::color_dialog;
 use crate::engine::{
-    Engine, ImageSyncParams, Source, AUDIO_SYNC_MODE, ENGINE_FAILED_EVENT, VIDEO_SYNC_MODE,
+    AudioParams, Engine, ImageSyncParams, Source, AUDIO_SYNC_MODE, ENGINE_FAILED_EVENT,
+    VIDEO_SYNC_MODE,
 };
 use crate::events::{self, Events};
 use crate::i18n::{t, Lang, Language};
@@ -152,11 +153,8 @@ pub struct Ui {
     pending_boot_sync: Option<SyncActive>,
     /// Image Sync tuning, handed to the engine on every (re)start.
     params: ImageSyncParams,
-    /// Audio sync loudness → intensity multiplier.
-    audio_gain: f32,
-    audio_color: AudioColor,
-    audio_blink: Blink,
-    audio_range: DynamicRange,
+    /// Audio Sync tuning, applied live through the engine's shared slot.
+    audio: AudioParams,
     /// Saved UI language (applies on next launch).
     language: Language,
     /// Monitor state as last pushed by this app: brightness, device mode and
@@ -214,13 +212,16 @@ pub fn build_ui(
         params.fps = v;
     }
     engine.set_image_params(params);
+    let audio = AudioParams {
+        gain: settings.audio_gain.unwrap_or(DEFAULT_GAIN),
+        color: settings.audio_color.unwrap_or(AudioColor::Rainbow),
+        blink: settings.audio_blink.unwrap_or(Blink::Normal),
+        range: settings.audio_range.unwrap_or(DynamicRange::Normal),
+    };
+    engine.set_audio_params(audio);
     engine.set_brightness(settings.brightness.unwrap_or(12));
     let (sampling, smoothing, boost, fps) =
         (params.sampling, params.smoothing, params.boost, params.fps);
-    let audio_gain = settings.audio_gain.unwrap_or(DEFAULT_GAIN);
-    let audio_color = settings.audio_color.unwrap_or(AudioColor::Rainbow);
-    let audio_blink = settings.audio_blink.unwrap_or(Blink::Normal);
-    let audio_range = settings.audio_range.unwrap_or(DynamicRange::Normal);
     let ui_language = settings.language.unwrap_or(Language::System);
 
     // Every check item is created up front and owned by Ui; build_menu appends
@@ -297,12 +298,12 @@ pub fn build_ui(
     let smooth_items: PresetChecks<f32> = build_presets(&SMOOTHING, "smooth", smoothing);
     let boost_items: PresetChecks<f32> = build_presets(&BOOST, "boost", boost);
     let fps_items: PresetChecks<u32> = build_presets(&FPS, "fps", fps);
-    let gain_items: PresetChecks<f32> = build_presets(&GAIN, "gain", audio_gain);
+    let gain_items: PresetChecks<f32> = build_presets(&GAIN, "gain", audio.gain);
     let audio_rainbow_item = CheckMenuItem::with_id(
         "audiocolor_rainbow",
         t().rainbow,
         true,
-        audio_color == AudioColor::Rainbow,
+        audio.color == AudioColor::Rainbow,
         None,
     );
     // The solid-color entry only carries a swatch when a solid color is
@@ -312,15 +313,15 @@ pub fn build_ui(
         "audiocolor_solid",
         t().solid_color,
         true,
-        match audio_color {
+        match audio.color {
             AudioColor::Solid(rgb) => Some(swatch_icon(rgb)),
             AudioColor::Rainbow => None,
         },
         None,
     );
-    let audio_blink_items: PresetChecks<Blink> = build_presets(&BLINK, "audioblink", audio_blink);
+    let audio_blink_items: PresetChecks<Blink> = build_presets(&BLINK, "audioblink", audio.blink);
     let audio_range_items: PresetChecks<DynamicRange> =
-        build_presets(&RANGE, "audiorange", audio_range);
+        build_presets(&RANGE, "audiorange", audio.range);
     let mut language_items: PresetChecks<Language> = Vec::new();
     for (i, (label, lang)) in LANGUAGES.iter().enumerate() {
         let text = if *lang == Language::System {
@@ -404,10 +405,7 @@ pub fn build_ui(
             boost,
             fps,
         },
-        audio_gain,
-        audio_color,
-        audio_blink,
-        audio_range,
+        audio,
         language: ui_language,
         brightness: settings.brightness,
         mode: settings.mode,
@@ -421,7 +419,7 @@ pub fn build_ui(
         status_item,
         mode_sub,
         painted_slots: settings.slot_colors.map(Some),
-        painted_audio_solid: Some(match audio_color {
+        painted_audio_solid: Some(match audio.color {
             AudioColor::Solid(rgb) => Some(rgb),
             AudioColor::Rainbow => None,
         }),
@@ -730,20 +728,11 @@ pub fn handle_event(id: String, ui: &mut Ui, quit: &mut bool) {
             } else if let Some(v) = parse_preset(&id, "fps_", &FPS) {
                 tweak(ui, ui.params.fps == v, |p| p.fps = v);
             } else if let Some(v) = parse_preset(&id, "gain_", &GAIN) {
-                if ui.audio_gain != v {
-                    ui.audio_gain = v;
-                    restart_audio(ui);
-                }
+                tweak_audio(ui, ui.audio.gain == v, |p| p.gain = v);
             } else if let Some(v) = parse_preset(&id, "audioblink_", &BLINK) {
-                if ui.audio_blink != v {
-                    ui.audio_blink = v;
-                    restart_audio(ui);
-                }
+                tweak_audio(ui, ui.audio.blink == v, |p| p.blink = v);
             } else if let Some(v) = parse_preset(&id, "audiorange_", &RANGE) {
-                if ui.audio_range != v {
-                    ui.audio_range = v;
-                    restart_audio(ui);
-                }
+                tweak_audio(ui, ui.audio.range == v, |p| p.range = v);
             } else if let Some(v) = parse_language(&id) {
                 select_language(ui, v);
             } else if let Some(slot) = id
@@ -891,10 +880,10 @@ fn current_settings(ui: &Ui) -> Settings {
         slot_colors: ui.slot_colors,
         image_sync_running: ui.sync == SyncActive::ImageSync,
         audio_running: ui.sync == SyncActive::Audio,
-        audio_gain: Some(ui.audio_gain),
-        audio_color: Some(ui.audio_color),
-        audio_blink: Some(ui.audio_blink),
-        audio_range: Some(ui.audio_range),
+        audio_gain: Some(ui.audio.gain),
+        audio_color: Some(ui.audio.color),
+        audio_blink: Some(ui.audio.blink),
+        audio_range: Some(ui.audio.range),
         language: Some(ui.language),
     }
 }
@@ -993,30 +982,23 @@ fn tweak(ui: &mut Ui, same: bool, set: impl FnOnce(&mut ImageSyncParams)) {
     }
 }
 
-/// Applies an audio-sync color change; restarts audio sync if running.
+/// Applies an Audio Sync params tweak live: the running loop re-reads the
+/// shared slot every cycle, so nothing restarts (a change here used to cost
+/// a ~1 s engine restart with an LED gap).
+fn tweak_audio(ui: &mut Ui, same: bool, set: impl FnOnce(&mut AudioParams)) {
+    if same {
+        return;
+    }
+    set(&mut ui.audio);
+    ui.engine.set_audio_params(ui.audio);
+}
+
+/// Applies an audio-sync color change live; the loop rebuilds the base
+/// palette from the slot when it sees the new setting.
 fn select_audio_color(ui: &mut Ui, v: AudioColor) {
-    if ui.audio_color != v {
-        ui.audio_color = v;
-        restart_audio(ui);
-    }
-}
-
-/// The Audio Sync source built from the current Ui params.
-fn audio_source(ui: &Ui) -> Source {
-    Source::Audio {
-        gain: ui.audio_gain,
-        color: ui.audio_color,
-        blink: ui.audio_blink,
-        range: ui.audio_range,
-    }
-}
-
-/// Restarts audio sync with the current params, if it is running (after a
-/// tuning tweak).
-fn restart_audio(ui: &mut Ui) {
-    if ui.sync == SyncActive::Audio {
-        ui.engine.stop();
-        ui.engine.start(audio_source(ui));
+    if ui.audio.color != v {
+        ui.audio.color = v;
+        ui.engine.set_audio_params(ui.audio);
     }
 }
 
@@ -1041,7 +1023,7 @@ fn start_sync(ui: &mut Ui, which: SyncActive) {
             // Audio sync drives the audio-sync mode, absent from the menu:
             // mirror it so the checks match.
             ui.mode = Some(AUDIO_SYNC_MODE);
-            ui.engine.start(audio_source(ui));
+            ui.engine.start(Source::Audio);
         }
         SyncActive::None => {}
     }
@@ -1091,7 +1073,7 @@ fn pick_slot_color(ui: &mut Ui, slot: u8) {
 /// Opens the native color picker; on accept the picked color becomes the
 /// audio sync solid color.
 fn pick_audio_color(ui: &mut Ui) {
-    let initial = match ui.audio_color {
+    let initial = match ui.audio.color {
         AudioColor::Solid(rgb) => Some(rgb),
         AudioColor::Rainbow => None,
     };
@@ -1261,13 +1243,13 @@ fn sync_menu(ui: &mut Ui) {
         item.set_checked(ui.params.fps == *v);
     }
     for (v, item) in &ui.gain_items {
-        item.set_checked(ui.audio_gain == *v);
+        item.set_checked(ui.audio.gain == *v);
     }
     for (v, item) in &ui.audio_blink_items {
-        item.set_checked(ui.audio_blink == *v);
+        item.set_checked(ui.audio.blink == *v);
     }
     for (v, item) in &ui.audio_range_items {
-        item.set_checked(ui.audio_range == *v);
+        item.set_checked(ui.audio.range == *v);
     }
     // Color entries carry the current value in their ICON (a swatch): the
     // picker returns arbitrary colors no fixed check could match.
@@ -1279,8 +1261,8 @@ fn sync_menu(ui: &mut Ui) {
         }
     }
     ui.audio_rainbow_item
-        .set_checked(ui.audio_color == AudioColor::Rainbow);
-    let solid = match ui.audio_color {
+        .set_checked(ui.audio.color == AudioColor::Rainbow);
+    let solid = match ui.audio.color {
         AudioColor::Solid(rgb) => Some(rgb),
         AudioColor::Rainbow => None,
     };

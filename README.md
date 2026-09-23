@@ -29,8 +29,8 @@ executable — no installer, no services, no account.
 - **Static colors** in 4 slots with a native color picker, 12 brightness
   levels, and the monitor's built-in Peaceful/Dynamic modes.
 - **Set and forget** — persistent settings, Windows autostart, 10-language
-  UI, single instance, and automatic recovery after monitor power events,
-  sleep or display-topology changes.
+  UI, single instance, instant re-plug detection, and automatic recovery
+  after monitor power events, sleep or display-topology changes.
 
 ## Supported monitors
 
@@ -141,6 +141,9 @@ capture of the default output device).
 - Hardware overlay planes (MPO) can freeze the duplicated image while the
   desktop moves on; a staleness watchdog recreates the duplication when that
   is detected.
+- Monitor re-plugs are detected through Windows device notifications, so the
+  strip recovers the moment the USB link returns; periodic reconnection
+  polling remains only as a fallback.
 - The monitor's lighting controller resets to its factory state on any power
   event (firmware behavior). The app re-asserts the saved lighting state on
   USB reconnection, topology change, Windows resume — plus one delayed
