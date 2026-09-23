@@ -1,5 +1,23 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- The startup recovery pass could be lost to a race between USB enumeration
+  and the UI build at logon autostart, leaving a still-booting lighting MCU
+  stuck on its factory preset; the pass is now also scheduled when the first
+  enumeration completes (idempotency-guarded).
+- Image sync now forces the first post-rearm frame out and restarts the
+  keepalive clock, so a monitor that just re-armed no longer sits on its
+  factory strip for up to 5 s on a static desktop.
+- Quitting during a briefly saturated USB queue could skip the monitor
+  disarm restore (brightness left at max on the reverted static preset):
+  the restore is now sent with ordered blocking sends.
+- settings.json now falls back to `%APPDATA%\lg-ultragear-rgb-control\`
+  when the executable's directory is not writable (Program Files installs),
+  instead of silently never persisting.
+
 ## v1.1 (2026-09-22)
 
 ### Fixed

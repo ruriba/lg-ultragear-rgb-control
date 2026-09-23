@@ -189,6 +189,16 @@ impl Engine {
         }
     }
 
+    /// Blocking send for shutdown sequences: unlike [`Engine::send`] this
+    /// never spawns a fallback thread, so several commands issued from one
+    /// thread keep their FIFO order even when the channel is full (a parked
+    /// sender is always admitted before a later direct send). Only for
+    /// callers already off the UI thread — it blocks — and the quit
+    /// watchdog bounds the wait.
+    pub fn send_blocking(&self, cmd: UsbCommand) {
+        let _ = self.tx.send(cmd);
+    }
+
     /// Starts the given sync source, unless the engine is already running.
     /// The session token leaves any previous thread (from before a stop and
     /// quick restart) out of the game.
@@ -647,6 +657,12 @@ fn image_sync_loop(
                 return;
             }
             reinit_needed = false;
+            // The monitor was just re-armed (its strip buffer may be
+            // factory-fresh after a power blip): force the next computed
+            // frame out even if it matches the last sent one, and restart
+            // the keepalive clock — mirroring the audio loop.
+            last_sent = None;
+            last_send = Instant::now();
         }
 
         // A display mode change with an unchanged DeviceName (HDR toggle,

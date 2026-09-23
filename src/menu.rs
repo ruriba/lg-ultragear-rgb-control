@@ -169,6 +169,9 @@ pub struct Ui {
     engine: Arc<Engine>,
     /// Sender for the delayed recovery pass (see schedule_recovery_repeat).
     events: Events,
+    /// True while a delayed recovery pass is pending: schedule_recovery_repeat
+    /// drops duplicates so two sources racing at startup cannot double-fire.
+    recovery_scheduled: bool,
     /// Disabled item showing the last notable state/diagnostic.
     status_item: MenuItem,
     /// The Mode submenu; its label names the active mode ("Mode - Static 2")
@@ -412,6 +415,7 @@ pub fn build_ui(
         connected,
         engine,
         events,
+        recovery_scheduled: false,
         resume: None,
         pending_boot_sync: None,
         status_item,
@@ -428,15 +432,13 @@ pub fn build_ui(
     push_device_state(&ui);
     // The monitor can be enumerated while its lighting MCU is still booting
     // (hard power cut, monitor waking from standby): the delayed pass
-    // re-asserts the state if the burst above landed on a deaf device. If
-    // the monitor is not there yet, its (re)connection event schedules the
-    // pass instead. (Gated on `connected`: firing it unconditionally
-    // re-armed healthy sessions ~1 s into their first frames and the mode
-    // switch blanked the whole strip. The engine's init re-asserts the
-    // frame-chunk count after its settle instead, which covers the same
-    // window without a visible blank.)
+    // re-asserts the state if the burst above landed on a deaf device. Gated
+    // on `connected` so a healthy resumed sync is spared a spurious
+    // controlled reinit; when enumeration publishes later, the
+    // CONNECTION_INIT handler schedules the pass instead (idempotent guard),
+    // so the race between enumeration and this check is covered either way.
     if ui.connected.load(Ordering::SeqCst) {
-        schedule_recovery_repeat(&ui);
+        schedule_recovery_repeat(&mut ui);
     }
 
     // Resume image sync or audio if either was running at exit. Their init
@@ -595,10 +597,16 @@ pub fn handle_event(id: String, ui: &mut Ui, quit: &mut bool) {
 
         usb::CONNECTION_INIT_EVENT => {
             // The worker's first enumeration finished after the UI seeded its
-            // texts (possibly stale-false): repaint only. The restore is
-            // already enqueued by build_ui, and a reconnect push here would
-            // drag a resuming sync out of its mode.
+            // texts (possibly stale-false): repaint only. The restore burst
+            // is already enqueued by build_ui, and a reconnect push here
+            // would drag a resuming sync out of its mode — but the delayed
+            // recovery pass DOES need scheduling here: build_ui's gate read
+            // `connected` before this enumeration published it, so in launches
+            // that lost that race the still-booting MCU would otherwise never
+            // be re-asserted. The guard deduplicates against build_ui's own
+            // schedule when enumeration won that race.
             refresh_status(ui);
+            schedule_recovery_repeat(ui);
         }
 
         events::CHANGED_EVENT => redetect_screen(ui),
@@ -608,6 +616,8 @@ pub fn handle_event(id: String, ui: &mut Ui, quit: &mut bool) {
         // while the lighting MCU is still booting. Reading the state NOW
         // means anything the user changed in the meantime wins.
         RESTORE_PUSH_EVENT => {
+            // Consumed: later sources may schedule a fresh pass.
+            ui.recovery_scheduled = false;
             if ui.connected.load(Ordering::SeqCst) {
                 recover_monitor(ui);
             }
@@ -655,9 +665,14 @@ pub fn handle_event(id: String, ui: &mut Ui, quit: &mut bool) {
                 _ => 1,
             };
             thread::spawn(move || {
-                engine.send(UsbCommand::SetBrightness(level));
-                engine.send(UsbCommand::SetMode(restore_mode));
-                engine.send(UsbCommand::Stop);
+                // Ordered blocking sends: Engine::send's per-command fallback
+                // threads have unspecified admission order when the FIFO is
+                // full, so Stop could overtake the restore and leave the
+                // monitor armed at sync brightness. The 5 s quit watchdog
+                // bounds the blocking.
+                engine.send_blocking(UsbCommand::SetBrightness(level));
+                engine.send_blocking(UsbCommand::SetMode(restore_mode));
+                engine.send_blocking(UsbCommand::Stop);
             });
             *quit = true;
         }
@@ -1171,7 +1186,15 @@ fn recover_monitor(ui: &mut Ui) {
 }
 
 /// Schedules one [`RESTORE_PUSH_EVENT`] after [`RECOVERY_REPEAT_DELAY`].
-fn schedule_recovery_repeat(ui: &Ui) {
+/// Idempotent while a pass is pending: several sources (app start, monitor
+/// (re)appearance, resume, topology change) can race within the same second
+/// and one pass re-reads the current state anyway. The RESTORE_PUSH handler
+/// clears the flag when the pass runs, re-arming the guard.
+fn schedule_recovery_repeat(ui: &mut Ui) {
+    if ui.recovery_scheduled {
+        return;
+    }
+    ui.recovery_scheduled = true;
     let events = ui.events;
     thread::spawn(move || {
         thread::sleep(RECOVERY_REPEAT_DELAY);

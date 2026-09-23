@@ -3,7 +3,7 @@
 //! or corrupt file just means defaults, and the next save rewrites it.
 
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 
 /// The persisted menu/monitor state. Every field optional: None = unknown
@@ -39,12 +39,41 @@ pub struct Settings {
     pub language: Option<crate::i18n::Language>,
 }
 
-/// settings.json next to the executable. None if the exe path can't be
-/// resolved: persistence is best-effort everywhere.
+/// Cheap writability probe: create and remove a marker file.
+fn dir_writable(dir: &Path) -> bool {
+    let probe = dir.join(".lg-tray-write-probe");
+    std::fs::write(&probe, b"").is_ok() && std::fs::remove_file(&probe).is_ok()
+}
+
+/// settings.json location: next to the executable (portable convention:
+/// everything the app writes stays together), falling back to
+/// `%APPDATA%\lg-ultragear-rgb-control\` when that directory is not
+/// writable — a non-elevated exe under Program Files can never save there
+/// (UAC file virtualization does not apply to 64-bit processes), and silent
+/// total loss of persistence is worse than splitting the app's files.
+/// Resolved once per process.
 fn settings_path() -> Option<PathBuf> {
-    let exe = std::env::current_exe().ok()?;
-    let dir = exe.parent()?;
-    Some(dir.join("settings.json"))
+    static CACHE: OnceLock<Option<PathBuf>> = OnceLock::new();
+    CACHE
+        .get_or_init(|| {
+            let exe_dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
+            let primary = exe_dir.join("settings.json");
+            if dir_writable(&exe_dir) {
+                return Some(primary);
+            }
+            let appdata = std::env::var_os("APPDATA")
+                .map(PathBuf::from)?
+                .join("lg-ultragear-rgb-control");
+            std::fs::create_dir_all(&appdata).ok()?;
+            let fallback = appdata.join("settings.json");
+            eprintln!(
+                "settings: {} is not writable; using {}",
+                exe_dir.display(),
+                fallback.display()
+            );
+            Some(fallback)
+        })
+        .clone()
 }
 
 /// Loads the settings file; any problem (missing, unreadable, corrupt) falls
