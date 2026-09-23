@@ -306,7 +306,7 @@ impl Capturer {
             D3D11CreateDevice(
                 &adapter,
                 D3D_DRIVER_TYPE_UNKNOWN,
-                None,
+                windows::Win32::Foundation::HMODULE::default(),
                 D3D11_CREATE_DEVICE_FLAG(0),
                 None,
                 D3D11_SDK_VERSION,

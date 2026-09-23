@@ -99,7 +99,7 @@ pub struct Lang {
     pub gain_medium: &'static str,
     pub gain_high: &'static str,
     pub sensitivity: &'static str,
-    /// Audio solid-color entry (its label shows the current hex when set).
+    /// Audio solid-color entry (its icon swatch shows the picked color).
     pub solid_color: &'static str,
     pub rainbow: &'static str,
     pub blink: &'static str,

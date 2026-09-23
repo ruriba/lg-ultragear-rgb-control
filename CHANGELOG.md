@@ -1,6 +1,20 @@
 # Changelog
 
-## Unreleased
+## v1.2.0 (2026-09-23)
+
+### Added
+
+- Windows device notifications now wake the USB worker the moment an HID
+  device interface arrives or is removed: re-plugging the monitor recovers
+  immediately instead of on the next poll. The periodic cadences remain as
+  a fallback, and the idle presence probe relaxed from 30 s to 120 s.
+- CI attaches the release executable to the GitHub Release when a `v*` tag
+  is pushed.
+
+### Changed
+
+- The `windows` dependency tree is unified on 0.62 (the version wasapi
+  already pulled), linking one copy of the Win32 bindings instead of two.
 
 ### Fixed
 
@@ -14,6 +28,19 @@
 - Quitting during a briefly saturated USB queue could skip the monitor
   disarm restore (brightness left at max on the reverted static preset):
   the restore is now sent with ordered blocking sends.
+- The disarm/restore command pairs (static restore after stopping a sync,
+  engine-failure disarm, quit) now travel one ordered blocking sequence:
+  under a saturated USB queue the two commands could be admitted in either
+  order.
+- Image sync re-validates its session immediately before enqueueing a frame
+  or keepalive: a frame acquired during the stop's up-to-200 ms acquire
+  window could previously slip past the session invalidation and land on top
+  of the command the user just issued.
+- Brightness changes now apply within one capture wakeup while Image Sync
+  runs on a still desktop: the software dimming is applied at send time from
+  the live level (and the last colors are re-pushed when the level changes)
+  instead of being baked into the last computed frame, which a static
+  desktop never refreshes.
 - settings.json now falls back to `%APPDATA%\lg-ultragear-rgb-control\`
   when the executable's directory is not writable (Program Files installs),
   instead of silently never persisting.

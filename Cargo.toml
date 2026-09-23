@@ -1,13 +1,13 @@
 [package]
 name = "lg-ultragear-rgb-control"
-version = "1.1.0"
+version = "1.2.0"
 edition = "2021"
 
 [build-dependencies]
 winresource = "0.1"
 # Compiles src/compute.hlsl to DXBC at build time (only the build host needs
 # d3dcompiler_47; the shipped exe never does).
-windows = { version = "0.58", features = [
+windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Graphics_Direct3D",
     "Win32_Graphics_Direct3D_Fxc",
@@ -19,8 +19,9 @@ tray-icon = "0.19"
 hidapi = "2.6"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-# Our only direct windows stack (wasapi pulls its own windows 0.62 tree).
-windows = { version = "0.58", features = [
+# Same windows tree wasapi pulls (0.62), so only one copy of the Win32
+# bindings links into the binary.
+windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_Graphics_Direct3D",
     "Win32_Graphics_Direct3D11",
@@ -35,6 +36,7 @@ windows = { version = "0.58", features = [
     "Win32_UI_HiDpi",           # per-monitor DPI awareness (menu/dialog crispness)
     "Win32_System_LibraryLoader",   # GetModuleHandleW + uxtheme dark-mode ordinals
     "Win32_Devices_Display",    # RGB-strip monitor detection (QueryDisplayConfig)
+    "Win32_Devices_HumanInterfaceDevice", # GUID_DEVINTERFACE_HID (device notifications)
     "Win32_Graphics_Gdi",       # monitor info for dialog centering
 ] }
 wasapi = "0.24.0"

@@ -420,3 +420,85 @@ fn default_buffer(
         .map_err(|e| format!("CreateBuffer: {e}"))?;
     buf.ok_or_else(|| "CreateBuffer: null".into())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sampling::{self, SamplingMode};
+
+    /// Independent statement of the CPU sampler's grid: from (x0, y0), step
+    /// by the shared adaptive stride while inside the block. The dispatch
+    /// table must visit exactly these pixels — this is the bit-exactness
+    /// contract between the CPU reference and the shader.
+    fn cpu_grid(x0: u32, y0: u32, x1: u32, y1: u32) -> Vec<(u32, u32)> {
+        let (w, h) = (x1 - x0, y1 - y0);
+        let stride = sampling::block_stride((w * h) as usize) as u32;
+        let mut pts = Vec::new();
+        let mut y = y0;
+        while y < y1 {
+            let mut x = x0;
+            while x < x1 {
+                pts.push((x, y));
+                x += stride;
+            }
+            y += stride;
+        }
+        pts
+    }
+
+    #[test]
+    fn dispatch_grid_matches_the_cpu_reference() {
+        for (w, h) in [(1366u32, 768u32), (1920, 1080), (3840, 2160)] {
+            for mode in [
+                SamplingMode::Border5,
+                SamplingMode::Border15,
+                SamplingMode::Full,
+            ] {
+                let blocks = sampling::build_sample_blocks(w as usize, h as usize, mode);
+                let (data, counts) = block_dispatch(&blocks);
+                for (i, &(bx0, by0, bx1, by1)) in blocks.iter().enumerate() {
+                    // The shader's walk from the dispatch table's own words.
+                    let geo = data[i * 2];
+                    let stride = data[i * 2 + 1][0];
+                    let mut gpu_pts = Vec::new();
+                    for k in 0..geo[2] * geo[3] {
+                        gpu_pts.push((
+                            geo[0] + (k % geo[2]) * stride,
+                            geo[1] + (k / geo[2]) * stride,
+                        ));
+                    }
+                    assert_eq!(
+                        gpu_pts,
+                        cpu_grid(bx0 as u32, by0 as u32, bx1 as u32, by1 as u32),
+                        "{mode:?} {w}x{h} block {i} diverged"
+                    );
+                    assert_eq!(counts[i] as usize, gpu_pts.len());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn full_mode_keeps_blocks_near_four_thousand_samples() {
+        // The adaptive stride targets ~4096 samples per block; integer
+        // truncation of the stride pushes the ceil-product above it (at 4K
+        // the widest strips reach 4725). Small border blocks go
+        // pixel-by-pixel (stride 1, every pixel).
+        let blocks = sampling::build_sample_blocks(3840, 2160, SamplingMode::Full);
+        let (_data, counts) = block_dispatch(&blocks);
+        for &c in &counts {
+            assert!(
+                (4096..=4800).contains(&c),
+                "full-mode count {c} out of band"
+            );
+        }
+
+        let blocks = sampling::build_sample_blocks(1920, 1080, SamplingMode::Border5);
+        let (data, counts) = block_dispatch(&blocks);
+        for (i, &(bx0, by0, bx1, by1)) in blocks.iter().enumerate() {
+            let area = ((bx1 - bx0) as usize) * ((by1 - by0) as usize);
+            assert_eq!(data[i * 2 + 1][0], 1); // stride 1: pixel-by-pixel
+            assert_eq!(counts[i] as usize, area);
+        }
+    }
+}

@@ -19,8 +19,8 @@ shows the connection state at all times.
   **Turn LEDs on** resumes the same sync source.
 - **Brightness ▸ Level 1–12** — LED brightness. On the static modes it sets
   the monitor's backlight level. While a sync runs it dims the LEDs in
-  software (the monitor stays at max) and takes effect on the next frame,
-  without stopping the sync.
+  software (the monitor stays at max) and applies within a fraction of a
+  second, without stopping the sync.
 - **Modes ▸ Static 1–4 / Peaceful / Dynamic** — the monitor's built-in
   modes. Static 1–4 show the color stored in each slot (set it under
   **Color**); Peaceful and Dynamic are LG's own animations. Selecting any of
@@ -121,6 +121,7 @@ start the display topology may not be ready yet).
 
 ## Quit
 
-Stops any running sync, restores Static 1 and exits. Settings were already
-saved after every change, so the next launch resumes exactly where you left
-off (including a running sync).
+Stops any running sync, leaves the monitor on the last static mode you
+explicitly selected (Static 1 when none was set) and exits. Settings were
+already saved after every change, so the next launch resumes exactly where
+you left off (including a running sync).

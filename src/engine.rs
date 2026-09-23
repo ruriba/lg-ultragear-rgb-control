@@ -494,6 +494,10 @@ fn ensure_capturer(
 /// smoothing and dimming applied) and whether anything changed.
 struct FrameDecision {
     colors: [RGBColor; 48],
+    /// The same colors before software dimming, so a later brightness change
+    /// can re-dim and re-push them without a fresh frame (a still desktop
+    /// delivers none).
+    undimmed: [RGBColor; 48],
     /// False when the colors are byte-identical to what the monitor already
     /// shows (dedup: nothing to send).
     changed: bool,
@@ -501,21 +505,22 @@ struct FrameDecision {
     stagnant: bool,
 }
 
-/// Finalizes one arrived frame and updates the watchdog accounting.
+/// Finalizes one arrived frame and updates the watchdog accounting. `lvl` is
+/// the current software-dimming level, applied to the returned colors.
 /// `stale_frames` is the watchdog's consecutive-identical-frames counter and
 /// `settling` suppresses it right after a display-change recreation.
 #[allow(clippy::too_many_arguments)]
 fn handle_frame(
     fd: &crate::capture::FrameData,
     params: &ImageSyncParams,
-    brightness: &AtomicU8,
+    lvl: u8,
     last_sent: Option<&[RGBColor; 48]>,
     stale_frames: &mut u32,
     settling: bool,
     prev: &mut [[u8; 3]; 48],
     first_frame: &mut bool,
 ) -> FrameDecision {
-    let mut colors = sampling::finalize(
+    let undimmed = sampling::finalize(
         &fd.sums,
         &fd.counts,
         prev,
@@ -523,16 +528,7 @@ fn handle_frame(
         params.smoothing,
         params.boost,
     );
-    // Software dimming: the device sits at max brightness during sync and
-    // the level is applied here, so changing it never stops the sync.
-    let lvl = brightness.load(Ordering::Relaxed);
-    if lvl < SYNC_BRIGHTNESS {
-        for c in colors.iter_mut() {
-            c.r = (c.r as u32 * lvl as u32 / SYNC_BRIGHTNESS as u32) as u8;
-            c.g = (c.g as u32 * lvl as u32 / SYNC_BRIGHTNESS as u32) as u8;
-            c.b = (c.b as u32 * lvl as u32 / SYNC_BRIGHTNESS as u32) as u8;
-        }
-    }
+    let colors = dim_colors(undimmed, lvl);
     let same = last_sent == Some(&colors);
     // MPO staleness watchdog: frames keep arriving with frozen pixels while
     // the real desktop moves on (hardware overlay planes bypass the
@@ -559,9 +555,26 @@ fn handle_frame(
     }
     FrameDecision {
         colors,
+        undimmed,
         changed: !same,
         stagnant,
     }
+}
+
+/// Software dimming: the device sits at max brightness during sync and the
+/// level (1..=SYNC_BRIGHTNESS) is applied to the colors instead, so changing
+/// it never stops the sync. Applied at every send site — never baked into the
+/// stored frame state — so a level change can re-push the last colors dimmed
+/// at the new level without waiting for a fresh frame.
+fn dim_colors(mut colors: [RGBColor; 48], lvl: u8) -> [RGBColor; 48] {
+    if lvl < SYNC_BRIGHTNESS {
+        for c in colors.iter_mut() {
+            c.r = (c.r as u32 * lvl as u32 / SYNC_BRIGHTNESS as u32) as u8;
+            c.g = (c.g as u32 * lvl as u32 / SYNC_BRIGHTNESS as u32) as u8;
+            c.b = (c.b as u32 * lvl as u32 / SYNC_BRIGHTNESS as u32) as u8;
+        }
+    }
+    colors
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -592,8 +605,13 @@ fn image_sync_loop(
     // RETRY_DELAY pacing exists to separate consecutive duplications.
     let mut first_creation = true;
     // Dedup + keepalive state: last colors the monitor received, and when.
+    // `last_undimmed` keeps the pre-dimming colors so a brightness change can
+    // re-dim and re-push them without a fresh frame; `applied_lvl` is the
+    // level the last send was dimmed at.
     let mut last_sent: Option<[RGBColor; 48]> = None;
+    let mut last_undimmed: Option<[RGBColor; 48]> = None;
     let mut last_send = Instant::now();
+    let mut applied_lvl = brightness.load(Ordering::Relaxed);
     // Consecutive arrived frames with identical colors (staleness watchdog).
     let mut stale_frames = 0u32;
     // Watchdog suppression window after a display-change recreation.
@@ -634,6 +652,9 @@ fn image_sync_loop(
         // for snappier LEDs.
         let params = *image_params.lock().unwrap();
         let frame_ms = Duration::from_millis((1000 / params.fps.max(1) as u64).max(1));
+        // Brightness slot, read once per iteration: handle_frame dims with it
+        // and the re-push below re-sends when it changed.
+        let lvl = brightness.load(Ordering::Relaxed);
 
         // Monitor absent (unplug, sleep, KVM switch): pause capture entirely
         // instead of burning CPU on frames nobody will consume.
@@ -713,17 +734,29 @@ fn image_sync_loop(
                     srv_sum += s.srv_created as u64;
                     last_hdr = s.hdr;
                 }
+                // A stop can land while AcquireNextFrame blocked (up to
+                // ACQUIRE_TIMEOUT_MS): re-validate before anything is
+                // enqueued from this arm, so this session's frame cannot slip
+                // past the stop's SetSession — which may still be parked on a
+                // full FIFO — and land on top of the user's command. Same
+                // contract as the audio loop's pre-send check.
+                if !state.is_valid(mine) {
+                    break;
+                }
                 let settling = settle_until.is_some_and(|t| Instant::now() < t);
                 let decision = handle_frame(
                     &fd,
                     &params,
-                    brightness,
+                    lvl,
                     last_sent.as_ref(),
                     &mut stale_frames,
                     settling,
                     &mut prev,
                     &mut first_frame,
                 );
+                // Latest pre-dimming colors: the brightness re-push re-dims
+                // these when the level changes with no fresh frame coming.
+                last_undimmed = Some(decision.undimmed);
                 if decision.stagnant {
                     stale_recreates += 1;
                     eprintln!("Capture stagnant: recreating duplication");
@@ -769,6 +802,28 @@ fn image_sync_loop(
             continue;
         }
 
+        // Brightness changes apply immediately even on a still desktop: no
+        // frames arrive there for the dimming to ride on, so re-push the last
+        // computed colors dimmed at the new level (otherwise the change would
+        // wait out the keepalive cadence, showing the old dimming for up to
+        // SYNC_KEEPALIVE). Gated on last_sent: after a re-arm there are no
+        // colors worth restoring — the next computed frame brings them.
+        if lvl != applied_lvl && state.is_valid(mine) {
+            applied_lvl = lvl;
+            if last_sent.is_some() {
+                if let Some(colors) = last_undimmed {
+                    let out = dim_colors(colors, lvl);
+                    last_sent = Some(out);
+                    last_send = Instant::now();
+                    if let Err(TrySendError::Full(_)) =
+                        tx.try_send(UsbCommand::SendColors(mine, out, false))
+                    {
+                        queue_full += 1;
+                    }
+                }
+            }
+        }
+
         // Keepalive: the monitor reverts out of sync mode after ~12 s without
         // frames (measured on hardware). Whenever nothing has been sent for
         // SYNC_KEEPALIVE — static desktop, or frames deduped as identical —
@@ -787,6 +842,11 @@ fn image_sync_loop(
                     ));
                 }
             } else if let Some(colors) = &last_sent {
+                // Same re-validation as the frame send: this wakeup can span
+                // a stop that arrived during the acquire timeout.
+                if !state.is_valid(mine) {
+                    break;
+                }
                 keepalives += 1;
                 if let Err(TrySendError::Full(_)) =
                     tx.try_send(UsbCommand::SendColors(mine, *colors, false))
@@ -1004,5 +1064,194 @@ fn audio_loop(
             }
             last_send = Instant::now();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn frame(avg: [u32; 3], dirty_hit: bool) -> crate::capture::FrameData {
+        crate::capture::FrameData {
+            // counts = 4, so the sums are the average times four.
+            sums: [[avg[0] * 4, avg[1] * 4, avg[2] * 4]; 48],
+            counts: [4; 48],
+            dirty_hit,
+            stats: None,
+        }
+    }
+
+    fn params(smoothing: f32) -> ImageSyncParams {
+        ImageSyncParams {
+            sampling: SamplingMode::Border5,
+            smoothing,
+            boost: 1.0,
+            fps: 30,
+        }
+    }
+
+    /// Pushes `n` identical frames through the watchdog at full brightness,
+    /// returning whether it ever fired.
+    fn watchdog_fires(fd: &crate::capture::FrameData, settling: bool, n: u32) -> bool {
+        let p = params(0.0);
+        let mut prev = [[0u8; 3]; 48];
+        let mut first = true;
+        let mut stale = 0u32;
+        let mut last: Option<[RGBColor; 48]> = None;
+        let mut fired = false;
+        for _ in 0..n {
+            let d = handle_frame(
+                fd,
+                &p,
+                SYNC_BRIGHTNESS,
+                last.as_ref(),
+                &mut stale,
+                settling,
+                &mut prev,
+                &mut first,
+            );
+            last = Some(d.colors);
+            fired |= d.stagnant;
+        }
+        fired
+    }
+
+    #[test]
+    fn dedup_flags_unchanged_colors() {
+        let p = params(0.0);
+        let fd = frame([60, 30, 0], false);
+        let mut prev = [[0u8; 3]; 48];
+        let mut first = true;
+        let mut stale = 0u32;
+        let d1 = handle_frame(
+            &fd,
+            &p,
+            SYNC_BRIGHTNESS,
+            None,
+            &mut stale,
+            false,
+            &mut prev,
+            &mut first,
+        );
+        assert!(d1.changed);
+        assert_eq!(
+            (d1.colors[0].r, d1.colors[0].g, d1.colors[0].b),
+            (60, 30, 0)
+        );
+        // Same desktop again: byte-identical colors, nothing to send.
+        let d2 = handle_frame(
+            &fd,
+            &p,
+            SYNC_BRIGHTNESS,
+            Some(&d1.colors),
+            &mut stale,
+            false,
+            &mut prev,
+            &mut first,
+        );
+        assert!(!d2.changed && !d2.stagnant);
+    }
+
+    #[test]
+    fn dimming_scales_and_dedups_on_dimmed_bytes() {
+        let p = params(0.0);
+        let fd = frame([60, 30, 0], false);
+        let mut prev = [[0u8; 3]; 48];
+        let mut first = true;
+        let mut stale = 0u32;
+        let full = handle_frame(
+            &fd,
+            &p,
+            SYNC_BRIGHTNESS,
+            None,
+            &mut stale,
+            false,
+            &mut prev,
+            &mut first,
+        );
+        assert_eq!(
+            (full.colors[0].r, full.colors[0].g, full.colors[0].b),
+            (60, 30, 0)
+        );
+        let dim = handle_frame(&fd, &p, 6, None, &mut stale, false, &mut prev, &mut first);
+        // The pre-dimming colors are independent of the level; only the
+        // bytes bound for the monitor change.
+        assert_eq!(dim.undimmed, full.undimmed);
+        assert_eq!(
+            (dim.colors[0].r, dim.colors[0].g, dim.colors[0].b),
+            (30, 15, 0)
+        );
+        // Dimmed bytes identical to what the monitor got: dedup holds.
+        let again = handle_frame(
+            &fd,
+            &p,
+            6,
+            Some(&dim.colors),
+            &mut stale,
+            false,
+            &mut prev,
+            &mut first,
+        );
+        assert!(!again.changed);
+    }
+
+    #[test]
+    fn first_frame_skips_smoothing_then_blends() {
+        let p = params(0.9);
+        let mut prev = [[9u8; 3]; 48];
+        let mut first = true;
+        let mut stale = 0u32;
+        let a = handle_frame(
+            &frame([100, 0, 0], false),
+            &p,
+            SYNC_BRIGHTNESS,
+            None,
+            &mut stale,
+            false,
+            &mut prev,
+            &mut first,
+        );
+        // First frame snaps to the real color instead of fading in from prev.
+        assert_eq!(a.colors[0].r, 100);
+        let b = handle_frame(
+            &frame([200, 0, 0], false),
+            &p,
+            SYNC_BRIGHTNESS,
+            Some(&a.colors),
+            &mut stale,
+            false,
+            &mut prev,
+            &mut first,
+        );
+        // 0.9*100 + 0.1*200 = 110.
+        assert_eq!(b.colors[0].r, 110);
+        assert!(b.changed);
+    }
+
+    #[test]
+    fn watchdog_needs_dirty_overlap_and_fires_at_threshold() {
+        let dirty = frame([60, 0, 0], true);
+        // The seeding call is a "change", so the threshold needs one extra
+        // identical frame: one short of that, never fires.
+        assert!(!watchdog_fires(&dirty, false, STALE_FRAMES_BEFORE_RECREATE));
+        assert!(watchdog_fires(
+            &dirty,
+            false,
+            STALE_FRAMES_BEFORE_RECREATE + 2
+        ));
+        // Activity outside the sampled blocks explains identical colors:
+        // the duplication is healthy, never recreate.
+        let clean = frame([60, 0, 0], false);
+        assert!(!watchdog_fires(
+            &clean,
+            false,
+            STALE_FRAMES_BEFORE_RECREATE * 3
+        ));
+        // Right after a display-change recreation the watchdog is suppressed.
+        assert!(!watchdog_fires(
+            &dirty,
+            true,
+            STALE_FRAMES_BEFORE_RECREATE * 3
+        ));
     }
 }

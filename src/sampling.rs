@@ -251,6 +251,41 @@ mod tests {
     }
 
     #[test]
+    fn every_mode_yields_valid_blocks_at_common_resolutions() {
+        for (w, h) in [
+            (640, 480),
+            (1024, 600),
+            (1280, 1024),
+            (1366, 768),
+            (1920, 1080),
+            (2560, 1080),
+            (2560, 1440),
+            (3440, 1440),
+            (3840, 1600),
+            (3840, 2160),
+        ] {
+            for mode in [
+                SamplingMode::Border5,
+                SamplingMode::Border15,
+                SamplingMode::Full,
+            ] {
+                let blocks = build_sample_blocks(w, h, mode);
+                assert_eq!(blocks.len(), 48, "{mode:?} at {w}x{h}");
+                for (x0, y0, x1, y1) in blocks {
+                    assert!(
+                        x1 > x0 && y1 > y0,
+                        "degenerate block {mode:?} at {w}x{h}: {x0},{y0},{x1},{y1}"
+                    );
+                    assert!(
+                        x1 <= w as u16 && y1 <= h as u16,
+                        "out of bounds {mode:?} at {w}x{h}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn full_screen_blocks_tile_the_screen() {
         // (w, h, cx, cy) = (1920, 1080, 960, 540). The five groups tile the
         // screen: sums of widths/heights per group must add up exactly.

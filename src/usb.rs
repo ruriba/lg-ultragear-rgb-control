@@ -1,7 +1,10 @@
 //! USB worker thread: owns the single `HidApi` instance, translates commands
-//! to HID writes, discards stale image sync frames by session, and keeps trying
-//! to reconnect in the background when the monitor disappears (unplug, sleep,
-//! re-plug). Connection changes are published to the UI via the event proxy.
+//! to HID writes, discards stale image sync frames by session, and keeps the
+//! device present in the background: Windows device-interface notifications
+//! (relayed by the UI as [`UsbCommand::Probe`]) wake an immediate presence
+//! check whenever an HID device arrives or leaves, with the periodic cadences
+//! below as a fallback for missed notifications. Connection changes are
+//! published to the UI via the event proxy.
 //!
 //! Commands and sync frames share one bounded FIFO, and every queued message
 //! wakes the worker immediately. Frames are enqueued with try_send: if the
@@ -30,13 +33,15 @@ const LG_VID: u16 = 0x043E;
 /// 0x9A8A: 27GN950/38GN950; 0x9A57: 38GL950G. For the 9A8A the usage page
 /// must be 0xFF01 or 0.
 const USAGE_PAGE: u16 = 0xFF01;
-/// Reconnect attempt cadence while the monitor is missing.
+/// Fallback reconnect attempt cadence while the monitor is missing (a
+/// device-list enumeration per attempt). HID arrival notifications normally
+/// reconnect instantly; this only backstops them.
 const RECONNECT_EVERY: Duration = Duration::from_secs(2);
-/// Presence-probe and idle-tick cadence while connected (a device-list
-/// enumeration per tick). An unplug during activity is still detected
-/// immediately by failing writes; the probe only matters while idle, where
-/// nothing visible depends on it.
-const PRESENCE_PROBE_EVERY: Duration = Duration::from_secs(30);
+/// Fallback presence-probe cadence while connected (a device-list
+/// enumeration per tick). Device-interface notifications catch unplugs
+/// immediately and failing writes catch them during activity, so this only
+/// backstops a missed notification while idle.
+const PRESENCE_PROBE_EVERY: Duration = Duration::from_secs(120);
 /// Consecutive write failures before dropping the device handle.
 const MAX_FAILS: u32 = 5;
 
@@ -59,7 +64,32 @@ pub enum UsbCommand {
     /// 48-color sync frame; the flag selects the audio (0xC2) marker instead
     /// of video (0xC1).
     SendColors(u64, [RGBColor; 48], bool),
+    /// Immediate presence check (a device-interface notification arrived):
+    /// the same recovery work as the periodic cadences, without the wait.
+    Probe,
     Stop,
+}
+
+/// The worker's session bookkeeping, extracted so its ordering guarantees
+/// are unit-testable: registration is monotonic (a SetSession parked in
+/// Engine::send's fallback thread can never regress the active session and
+/// permanently discard a newer session's frames), and only the registered
+/// session's frames pass through to the device.
+#[derive(Default)]
+struct SessionGate {
+    active: u64,
+}
+
+impl SessionGate {
+    fn register(&mut self, s: u64) {
+        if s > self.active {
+            self.active = s;
+        }
+    }
+
+    fn accepts(&self, frame_session: u64) -> bool {
+        frame_session == self.active
+    }
 }
 
 pub fn spawn_usb_thread(
@@ -83,7 +113,7 @@ fn usb_loop(rx: Receiver<UsbCommand>, connected: &AtomicBool, events: &Events) {
     }
     let mut device = api.as_ref().and_then(open_monitor);
     let mut fails = 0u32;
-    let mut active_session = 0u64;
+    let mut session = SessionGate::default();
     let mut last_attempt = Instant::now();
     let mut last_probe = Instant::now();
     let found = device.is_some();
@@ -112,6 +142,7 @@ fn usb_loop(rx: Receiver<UsbCommand>, connected: &AtomicBool, events: &Events) {
                     &mut last_probe,
                     connected,
                     events,
+                    false,
                 );
                 continue;
             }
@@ -125,16 +156,29 @@ fn usb_loop(rx: Receiver<UsbCommand>, connected: &AtomicBool, events: &Events) {
             break;
         }
         // SetSession is pure bookkeeping: process it even without a device —
-        // dropping it while the monitor was missing left active_session
-        // stale, so after a reconnect every image sync frame was discarded
-        // forever. Monotonic: a SetSession parked in Engine::send's fallback
-        // thread can land after a newer session's registration; letting it
-        // regress active_session would discard the live session's frames
-        // forever.
+        // dropping it while the monitor was missing left the gate stale, so
+        // after a reconnect every image sync frame was discarded forever.
+        // Monotonic: a SetSession parked in Engine::send's fallback thread
+        // can land after a newer session's registration; letting it regress
+        // the gate would discard the live session's frames forever.
         if let UsbCommand::SetSession(s) = cmd {
-            if s > active_session {
-                active_session = s;
-            }
+            session.register(s);
+            continue;
+        }
+
+        // A device-interface arrival/removal notification: run the presence
+        // check now, bypassing the pacing (notifications are the fast path;
+        // the cadences only backstop them).
+        if matches!(cmd, UsbCommand::Probe) {
+            maintain(
+                &mut api,
+                &mut device,
+                &mut last_attempt,
+                &mut last_probe,
+                connected,
+                events,
+                true,
+            );
             continue;
         }
 
@@ -146,6 +190,7 @@ fn usb_loop(rx: Receiver<UsbCommand>, connected: &AtomicBool, events: &Events) {
                 &mut last_probe,
                 connected,
                 events,
+                false,
             );
         }
         let Some(dev) = device.as_ref() else {
@@ -165,23 +210,25 @@ fn usb_loop(rx: Receiver<UsbCommand>, connected: &AtomicBool, events: &Events) {
                     format!("Store{s}({r:02x}{g:02x}{b:02x})")
                 }
                 UsbCommand::SendColors(s, _, _) => format!("FRAME s={s}"),
+                UsbCommand::Probe => "Probe".into(),
                 UsbCommand::Stop => "Stop".into(),
             };
             eprintln!(
-                "[usb] {kind} dev={} session={active_session}",
-                device.is_some()
+                "[usb] {kind} dev={} session={}",
+                device.is_some(),
+                session.active
             );
         }
-        let ok = execute(&cmd, dev, active_session);
+        let ok = execute(&cmd, dev, &session);
         on_write(ok, &mut fails, &mut device, connected, events);
     }
 }
 
-fn execute(cmd: &UsbCommand, dev: &HidDevice, active_session: u64) -> bool {
+fn execute(cmd: &UsbCommand, dev: &HidDevice, session: &SessionGate) -> bool {
     match cmd {
         UsbCommand::SendColors(s, colors, audio) => {
             // Frames from a stopped or superseded session: discard.
-            if *s == active_session {
+            if session.accepts(*s) {
                 usb_protocol::send_sync_colors(dev, colors, *audio)
             } else {
                 true
@@ -198,7 +245,7 @@ fn execute(cmd: &UsbCommand, dev: &HidDevice, active_session: u64) -> bool {
         UsbCommand::StoreStaticColor(slot, r, g, b) => {
             usb_protocol::store_static_color(dev, *slot, *r, *g, *b)
         }
-        UsbCommand::SetSession(_) | UsbCommand::Stop => {
+        UsbCommand::SetSession(_) | UsbCommand::Probe | UsbCommand::Stop => {
             // Handled by the drain loop before the device guard. Reachable
             // only if that routing ever changes: ignore rather than panic —
             // a panic here kills the USB worker and with it every monitor
@@ -234,6 +281,9 @@ fn on_write(
 /// device list first (a re-plugged HID device usually gets a new interface
 /// path, so stale paths would never match again). While connected, probes the
 /// enumeration so an unplug during idle updates the connection state.
+/// `force` bypasses the pacing: a device-interface notification arrived and
+/// the presence check should run now, not on the next cadence tick.
+#[allow(clippy::too_many_arguments)]
 fn maintain(
     api: &mut Option<HidApi>,
     device: &mut Option<HidDevice>,
@@ -241,10 +291,11 @@ fn maintain(
     last_probe: &mut Instant,
     connected: &AtomicBool,
     events: &Events,
+    force: bool,
 ) {
     // A failed HidApi init retries on the same cadence as a reconnect.
     if api.is_none() {
-        if last_attempt.elapsed() < RECONNECT_EVERY {
+        if !force && last_attempt.elapsed() < RECONNECT_EVERY {
             return;
         }
         *last_attempt = Instant::now();
@@ -255,7 +306,7 @@ fn maintain(
     }
     let api = api.as_mut().expect("api is Some above");
     if device.is_none() {
-        if last_attempt.elapsed() < RECONNECT_EVERY {
+        if !force && last_attempt.elapsed() < RECONNECT_EVERY {
             return;
         }
         *last_attempt = Instant::now();
@@ -266,7 +317,7 @@ fn maintain(
         publish_state(connected, events, is_some, true);
         return;
     }
-    if last_probe.elapsed() >= PRESENCE_PROBE_EVERY {
+    if force || last_probe.elapsed() >= PRESENCE_PROBE_EVERY {
         *last_probe = Instant::now();
         let _ = api.refresh_devices();
         let still_there = api.device_list().any(matches_monitor);
@@ -307,5 +358,34 @@ fn publish_state(connected: &AtomicBool, events: &Events, is_connected: bool, no
             }
         );
         events.send(CONNECTION_EVENT.to_string());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn session_registration_is_monotonic() {
+        let mut gate = SessionGate::default();
+        gate.register(5);
+        // A SetSession from an older stop, parked in a fallback thread and
+        // landing after a newer registration: must never regress the gate.
+        gate.register(3);
+        assert_eq!(gate.active, 5);
+        gate.register(9);
+        assert_eq!(gate.active, 9);
+    }
+
+    #[test]
+    fn only_the_registered_sessions_frames_pass() {
+        let mut gate = SessionGate::default();
+        gate.register(7); // a running session
+        assert!(gate.accepts(7));
+        assert!(!gate.accepts(6)); // a superseded session's late frame
+        gate.register(8); // stop's dead token: greater than any live session
+        assert!(!gate.accepts(7)); // the stopped session's in-flight frame
+        gate.register(9); // the next start
+        assert!(gate.accepts(9));
     }
 }

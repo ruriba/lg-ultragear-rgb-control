@@ -173,7 +173,7 @@ pub fn autostart_set(enable: bool) -> bool {
         if RegOpenKeyExW(
             HKEY_CURRENT_USER,
             w!("Software\\Microsoft\\Windows\\CurrentVersion\\Run"),
-            0,
+            Some(0),
             KEY_SET_VALUE,
             &mut hkey,
         ) != ERROR_SUCCESS
@@ -184,7 +184,7 @@ pub fn autostart_set(enable: bool) -> bool {
             RegSetValueExW(
                 hkey,
                 w!("lg-ultragear-rgb-control"),
-                0,
+                Some(0),
                 REG_SZ,
                 Some(&utf16_path),
             )

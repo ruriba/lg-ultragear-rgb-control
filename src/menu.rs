@@ -611,6 +611,13 @@ pub fn handle_event(id: String, ui: &mut Ui, quit: &mut bool) {
 
         events::CHANGED_EVENT => redetect_screen(ui),
 
+        // An HID device interface arrived or left (keyboard and mice count
+        // too): the worker re-checks monitor presence right away instead of
+        // waiting out its poll cadence.
+        events::DEVICE_EVENT => {
+            ui.engine.send(UsbCommand::Probe);
+        }
+
         // One-shot delayed recovery pass (see RECOVERY_REPEAT_DELAY): the
         // first burst after a monitor (re)appearance or app start can land
         // while the lighting MCU is still booting. Reading the state NOW
@@ -668,10 +675,12 @@ pub fn handle_event(id: String, ui: &mut Ui, quit: &mut bool) {
                 // Ordered blocking sends: Engine::send's per-command fallback
                 // threads have unspecified admission order when the FIFO is
                 // full, so Stop could overtake the restore and leave the
-                // monitor armed at sync brightness. The 5 s quit watchdog
-                // bounds the blocking.
-                engine.send_blocking(UsbCommand::SetBrightness(level));
+                // monitor armed at sync brightness. Mode before brightness,
+                // consistent with the other disarm sequences (brightness
+                // lands even while armed — hardware-verified). The 5 s quit
+                // watchdog bounds the blocking.
                 engine.send_blocking(UsbCommand::SetMode(restore_mode));
+                engine.send_blocking(UsbCommand::SetBrightness(level));
                 engine.send_blocking(UsbCommand::Stop);
             });
             *quit = true;
@@ -695,10 +704,20 @@ pub fn handle_event(id: String, ui: &mut Ui, quit: &mut bool) {
                 // brightness while it stays armed (same order as
                 // stop_engine).
                 ui.resume = None;
-                ui.engine.send(UsbCommand::SetMode(1));
+                // Ordered blocking sends off the UI thread, like quit:
+                // Engine::send's per-command fallback threads have
+                // unspecified admission order when the FIFO is full. Mode
+                // first, then brightness — the same disarm sequence as
+                // stop_engine (hardware-verified: brightness commands land
+                // even while the monitor stays armed in a sync mode, so the
+                // order is consistency rather than a requirement).
+                let engine = ui.engine.clone();
+                let level = ui.brightness.unwrap_or(12);
+                thread::spawn(move || {
+                    engine.send_blocking(UsbCommand::SetMode(1));
+                    engine.send_blocking(UsbCommand::SetBrightness(level));
+                });
                 ui.mode = Some(1);
-                ui.engine
-                    .send(UsbCommand::SetBrightness(ui.brightness.unwrap_or(12)));
                 // Uncheck so the menu matches reality and a retry from the
                 // menu is possible.
                 ui.sync = SyncActive::None;
@@ -893,16 +912,27 @@ fn stop_engine(ui: &mut Ui, restore_static1: bool) {
     if restore_static1 {
         // An explicit static restore cancels the resume memory.
         ui.resume = None;
-        // Leave the armed sync mode FIRST: the monitor ignores brightness
-        // while it stays armed, so the restore below only lands after the
-        // mode change.
-        ui.engine.send(UsbCommand::SetMode(1));
+        // Leave the sync mode first, then restore brightness — the disarm
+        // sequence every stop path uses. Both travel one ordered blocking
+        // sequence off the UI thread, like quit: Engine::send's per-command
+        // fallback threads have unspecified admission order when the FIFO is
+        // full. (Hardware-verified: brightness lands even while the monitor
+        // stays armed, so mode-first is consistency, not a requirement.)
+        let engine = ui.engine.clone();
+        let level = ui.brightness.unwrap_or(12);
+        let restore_brightness = was != SyncActive::None;
+        thread::spawn(move || {
+            engine.send_blocking(UsbCommand::SetMode(1));
+            if restore_brightness {
+                engine.send_blocking(UsbCommand::SetBrightness(level));
+            }
+        });
         ui.mode = Some(1);
-    }
-    if was != SyncActive::None {
+    } else if was != SyncActive::None {
         // Restore the device brightness for the static modes that follow
         // (during sync the device sat at max and the dimming was
-        // software-side, so the monitor is still at 12 here).
+        // software-side, so the monitor is still at 12 here). A single
+        // command: nothing behind it to stay ordered against.
         ui.engine
             .send(UsbCommand::SetBrightness(ui.brightness.unwrap_or(12)));
     }
@@ -1284,6 +1314,7 @@ fn apply_command_state(ui: &mut Ui, cmd: &UsbCommand) {
         | UsbCommand::StoreStaticColor(..)
         | UsbCommand::SendColors(..)
         | UsbCommand::SetSession(_)
+        | UsbCommand::Probe
         | UsbCommand::Stop => {}
     }
 }

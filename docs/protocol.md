@@ -24,7 +24,7 @@ acceptance, worker).
 | Brightness `n` | `CF 02 02 01 n n^0xDE` |
 | Mode `m` | `C7 02 02 00 m m^0xD7` |
 | Sync mode `m` (7/8) | the above + `CA 02 02 03 m m^0xD9` (arms the mode) |
-| Static color, slot `s` | `D2 s^03 s^04 s r g b crc8` (crc8 = XOR of header+payload, see below) |
+| Static color, slot `s` | `D2 s^03 04 s r g b crc8` (index check = `s ^ 0x0403` as two little-endian bytes; crc8 = XOR of header+payload, see below) |
 
 Modes: 1-4 = static color slots, 5 = Peaceful, 6 = Dynamic, **7 = Audio
 Sync**, **8 = Video Sync**. Check bytes travel inline inside each payload; the
@@ -50,6 +50,11 @@ C1|C2 02 91 00 | 48 × (R G B) | check
   with no HID notification. This is why the engine sends a keepalive frame
   every 5 s while the scene is static (see `SYNC_KEEPALIVE` in
   `src/engine.rs`).
+- **Brightness commands land while armed**: the device accepts brightness
+  changes even while it stays armed in a sync mode (verified: setting
+  brightness during image sync and then switching to a static mode keeps the
+  new level). Power commands, by contrast, are ignored until the sync timeout
+  or a mode change disarms it.
 - DXGI duplication can deliver BGRA8 frames even when the duplication was
   created as FP16/HDR; the delivered frame's format is authoritative and is
   re-checked every frame.

@@ -55,7 +55,9 @@ driven and the rest are ignored.
 **Download** the prebuilt `lg-ultragear-rgb-control.exe` from the
 [Releases](../../releases) page and run it — a tray icon appears, that's the
 whole app. `settings.json` (settings) and `lg-ultragear-rgb-control.log`
-(panics) are created next to the executable.
+(panics) are created next to the executable, or in
+`%APPDATA%\lg-ultragear-rgb-control\` when that directory is not writable
+(e.g. an install under Program Files).
 
 **Build from source** with a stable Rust toolchain (MSVC target):
 
@@ -121,8 +123,9 @@ capture of the default output device).
 - **Language** — follows the system UI language by default; a fixed choice
   applies on the next launch.
 - **Status line** — shows the connection state and the last diagnostic.
-- **Quit** — stops any sync, restores Static 1 and exits; the next launch
-  resumes exactly where you left off, including a running sync.
+- **Quit** — stops any sync, leaves the monitor on the static mode you
+  selected (Static 1 if none) and exits; the next launch resumes exactly
+  where you left off, including a running sync.
 
 ## How it works
 
