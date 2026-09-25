@@ -1,6 +1,6 @@
 [package]
 name = "lg-ultragear-rgb-control"
-version = "1.3.0"
+version = "1.4.0"
 edition = "2021"
 
 [build-dependencies]
@@ -31,7 +31,9 @@ windows = { version = "0.62", features = [
     "Win32_Security",           # required by CreateMutexW's signature
     "Win32_System_Registry",    # autostart
     "Win32_Globalization",      # UI language detection
-    "Win32_UI_Controls_Dialogs", # custom color picker (ChooseColor)
+    "Win32_System_Diagnostics_Debug", # debug builds: crash stack tracer
+    "Win32_System_Kernel",       # debug builds: exception records (vectored handler)
+    "Win32_System_Memory",      # panel close: empty the working set (frees RAM)
     "Win32_UI_WindowsAndMessaging", # message window (event pump, WM_DISPLAYCHANGE)
     "Win32_UI_HiDpi",           # per-monitor DPI awareness (menu/dialog crispness)
     "Win32_System_LibraryLoader",   # GetModuleHandleW + uxtheme dark-mode ordinals
@@ -40,8 +42,29 @@ windows = { version = "0.62", features = [
     "Win32_Graphics_Gdi",       # monitor info for dialog centering
 ] }
 wasapi = "0.24.0"
+# HWND of the panel window: close = native hide (Slint's own hide leaves a
+# blank surface on re-show), reopen = native show + center.
+raw-window-handle = "0.6"
+# Software renderer only: no OpenGL runtime in the panel (smaller exe,
+# less RAM, immune to GL driver/overlay quirks). femtovg can be restored
+# by swapping this line for plain slint = "1.18.1". accessibility (the
+# accesskit/UIA bridge, ~a dozen crates) stays off: nothing here uses it
+# and it costs real binary size; compat-1-2 (deprecated 1.2-era API
+# shims) is replaced by the mandatory compat-1-18 marker alone.
+slint = { version = "1.18.1", default-features = false, features = [
+    "std",
+    "backend-winit",
+    "renderer-software",
+    "compat-1-18",
+    "raw-window-handle-06",
+] }
 
 [profile.release]
+# "z" measured CPU-neutral against the default (3) for the sync engine
+# under a forced constant 30 fps capture load (interleaved A/B, avg 0.3%
+# of total on 12 cores either way): the per-frame cost is dominated by
+# driver/DXGI time, not the Rust code, so the ~2 MB smaller binary wins.
+opt-level = "z"
 lto = true
 codegen-units = 1
 strip = true

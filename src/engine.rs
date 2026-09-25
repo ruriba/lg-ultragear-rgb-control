@@ -55,6 +55,15 @@ const INIT_SETTLE: Duration = Duration::from_millis(250);
 /// colors (~2 s at 30 fps). A genuinely static desktop delivers no frames at
 /// all, so it never triggers this.
 const STALE_FRAMES_BEFORE_RECREATE: u32 = 60;
+/// Recreations that do NOT restore changing colors back off: each one
+/// doubles how many frames the next fire waits (60 → 120 → 240 → 480, i.e.
+/// ~2/4/8/16 s at 30 fps). A recreation that cures a real MPO freeze is
+/// immediately followed by real color changes, which reset the streak to
+/// zero and the threshold to its base — while the recurring look-alike
+/// (desktop activity inside the sampled blocks that never moves their
+/// average colors) only wastes its burst, and backs off until it is
+/// negligible. The cap keeps a stubborn real freeze retrying within ~16 s.
+const STALE_RECREATE_BACKOFF_SHIFTS: u32 = 3;
 /// Grace window after a display-change recreation: a desktop mode
 /// transition (HDR toggle, resolution change) keeps even freshly rebuilt
 /// duplications delivering frozen frames for several seconds while DWM and
@@ -538,6 +547,7 @@ fn handle_frame(
     lvl: u8,
     last_sent: Option<&[RGBColor; 48]>,
     stale_frames: &mut u32,
+    stale_threshold: u32,
     settling: bool,
     prev: &mut [[u8; 3]; 48],
     first_frame: &mut bool,
@@ -560,12 +570,13 @@ fn handle_frame(
     // activity outside the sampled blocks leaves them untouched while the
     // duplication is perfectly healthy (this used to recreate a live session
     // every few seconds). Only frames whose dirty rects overlap the sampled
-    // area count.
+    // area count. The fire threshold comes in with the backoff already
+    // applied (see STALE_RECREATE_BACKOFF_SHIFTS).
     let mut stagnant = false;
     if same {
         if fd.dirty_hit && !settling {
             *stale_frames += 1;
-            stagnant = *stale_frames >= STALE_FRAMES_BEFORE_RECREATE;
+            stagnant = *stale_frames >= stale_threshold;
         } else {
             *stale_frames = 0;
         }
@@ -636,6 +647,10 @@ fn image_sync_loop(
     let mut applied_lvl = brightness.load(Ordering::Relaxed);
     // Consecutive arrived frames with identical colors (staleness watchdog).
     let mut stale_frames = 0u32;
+    // Consecutive staleness recreations that did not restore changing
+    // colors: doubles the watchdog threshold each time (see
+    // STALE_RECREATE_BACKOFF_SHIFTS). Reset by any real color change.
+    let mut stale_streak: u32 = 0;
     // Watchdog suppression window after a display-change recreation.
     let mut settle_until: Option<Instant> = None;
     // Instrumentation (LGTRAY_STATS): counters for the periodic aggregate
@@ -766,12 +781,15 @@ fn image_sync_loop(
                     break;
                 }
                 let settling = settle_until.is_some_and(|t| Instant::now() < t);
+                let stale_threshold =
+                    STALE_FRAMES_BEFORE_RECREATE << stale_streak.min(STALE_RECREATE_BACKOFF_SHIFTS);
                 let decision = handle_frame(
                     &fd,
                     &params,
                     lvl,
                     last_sent.as_ref(),
                     &mut stale_frames,
+                    stale_threshold,
                     settling,
                     &mut prev,
                     &mut first_frame,
@@ -779,7 +797,16 @@ fn image_sync_loop(
                 // Latest pre-dimming colors: the brightness re-push re-dims
                 // these when the level changes with no fresh frame coming.
                 last_undimmed = Some(decision.undimmed);
-                if decision.stagnant {
+                if decision.changed {
+                    // Live colors are flowing: the duplication is
+                    // demonstrably healthy, so the next watchdog fire starts
+                    // from the base threshold again.
+                    stale_streak = 0;
+                } else if decision.stagnant {
+                    // This recreate did not restore changing colors (a cured
+                    // freeze is followed by real changes): the next one
+                    // waits longer.
+                    stale_streak = (stale_streak + 1).min(STALE_RECREATE_BACKOFF_SHIFTS);
                     stale_recreates += 1;
                     eprintln!("Capture stagnant: recreating duplication");
                     recreate = true;
@@ -1144,6 +1171,7 @@ mod tests {
                 SYNC_BRIGHTNESS,
                 last.as_ref(),
                 &mut stale,
+                STALE_FRAMES_BEFORE_RECREATE,
                 settling,
                 &mut prev,
                 &mut first,
@@ -1167,6 +1195,7 @@ mod tests {
             SYNC_BRIGHTNESS,
             None,
             &mut stale,
+            u32::MAX,
             false,
             &mut prev,
             &mut first,
@@ -1183,6 +1212,7 @@ mod tests {
             SYNC_BRIGHTNESS,
             Some(&d1.colors),
             &mut stale,
+            u32::MAX,
             false,
             &mut prev,
             &mut first,
@@ -1203,6 +1233,7 @@ mod tests {
             SYNC_BRIGHTNESS,
             None,
             &mut stale,
+            u32::MAX,
             false,
             &mut prev,
             &mut first,
@@ -1211,7 +1242,17 @@ mod tests {
             (full.colors[0].r, full.colors[0].g, full.colors[0].b),
             (60, 30, 0)
         );
-        let dim = handle_frame(&fd, &p, 6, None, &mut stale, false, &mut prev, &mut first);
+        let dim = handle_frame(
+            &fd,
+            &p,
+            6,
+            None,
+            &mut stale,
+            u32::MAX,
+            false,
+            &mut prev,
+            &mut first,
+        );
         // The pre-dimming colors are independent of the level; only the
         // bytes bound for the monitor change.
         assert_eq!(dim.undimmed, full.undimmed);
@@ -1226,6 +1267,7 @@ mod tests {
             6,
             Some(&dim.colors),
             &mut stale,
+            u32::MAX,
             false,
             &mut prev,
             &mut first,
@@ -1245,6 +1287,7 @@ mod tests {
             SYNC_BRIGHTNESS,
             None,
             &mut stale,
+            u32::MAX,
             false,
             &mut prev,
             &mut first,
@@ -1257,6 +1300,7 @@ mod tests {
             SYNC_BRIGHTNESS,
             Some(&a.colors),
             &mut stale,
+            u32::MAX,
             false,
             &mut prev,
             &mut first,
@@ -1303,5 +1347,105 @@ mod tests {
             true,
             STALE_FRAMES_BEFORE_RECREATE * 3
         ));
+    }
+
+    /// Drives the loop-side backoff bookkeeping the way the real loop does:
+    /// threshold from the streak, streak updated from the decision.
+    fn step(
+        stale_frames: &mut u32,
+        stale_streak: &mut u32,
+        last: Option<&[RGBColor; 48]>,
+        prev: &mut [[u8; 3]; 48],
+        first: &mut bool,
+        fd: &crate::capture::FrameData,
+    ) -> FrameDecision {
+        let threshold =
+            STALE_FRAMES_BEFORE_RECREATE << (*stale_streak).min(STALE_RECREATE_BACKOFF_SHIFTS);
+        let d = handle_frame(
+            fd,
+            &params(0.0),
+            SYNC_BRIGHTNESS,
+            last,
+            stale_frames,
+            threshold,
+            false,
+            prev,
+            first,
+        );
+        if d.changed {
+            *stale_streak = 0;
+        } else if d.stagnant {
+            *stale_streak = (*stale_streak + 1).min(STALE_RECREATE_BACKOFF_SHIFTS);
+        }
+        d
+    }
+
+    #[test]
+    fn useless_recreations_back_off_but_real_changes_reset() {
+        let dirty = frame([60, 0, 0], true);
+        let mut prev = [[0u8; 3]; 48];
+        let mut first = true;
+        let mut stale = 0u32;
+        let mut streak = 0u32;
+        let mut last: Option<[RGBColor; 48]> = None;
+
+        // Run a long stream of identical+dirty frames: fires come at 60,
+        // then 120, 240, 480, 480 … frames apart (the backoff), capped.
+        let max_gap = STALE_FRAMES_BEFORE_RECREATE << STALE_RECREATE_BACKOFF_SHIFTS;
+        let mut last_fire: Option<u32> = None;
+        let mut prev_gap = 0u32;
+        let mut fires = 0u32;
+        for i in 0..(STALE_FRAMES_BEFORE_RECREATE * 50) {
+            let d = step(
+                &mut stale,
+                &mut streak,
+                last.as_ref(),
+                &mut prev,
+                &mut first,
+                &dirty,
+            );
+            last = Some(d.colors);
+            if d.stagnant {
+                fires += 1;
+                if let Some(start) = last_fire {
+                    let gap = i - start;
+                    assert!(gap >= prev_gap, "gap shrank: {gap} < {prev_gap}");
+                    assert!(gap <= max_gap, "gap grew past the cap: {gap}");
+                    prev_gap = gap;
+                }
+                last_fire = Some(i);
+            }
+        }
+        assert_eq!(fires, 8); // 60+120+240+480+480+480+480+480 fits in 3000
+        assert_eq!(prev_gap, max_gap); // the cap held for the last fires
+
+        // One real color change proves the duplication is healthy: the
+        // streak resets, so the next fire needs the base threshold again.
+        let moved = frame([10, 200, 40], true);
+        let d = step(
+            &mut stale,
+            &mut streak,
+            last.as_ref(),
+            &mut prev,
+            &mut first,
+            &moved,
+        );
+        assert!(d.changed);
+        assert_eq!(streak, 0);
+        // From here, the fire takes the full base count again.
+        let mut fired = false;
+        for _ in 0..STALE_FRAMES_BEFORE_RECREATE {
+            let d = step(
+                &mut stale,
+                &mut streak,
+                last.as_ref(),
+                &mut prev,
+                &mut first,
+                &dirty,
+            );
+            last = Some(d.colors);
+            fired |= d.stagnant;
+        }
+        assert!(fired);
     }
 }

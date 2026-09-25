@@ -4,7 +4,7 @@
 //! the saved setting, falling back to the Windows UI language); `t()` reads it
 //! anywhere afterwards.
 
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use windows::Win32::Globalization::GetUserDefaultUILanguage;
 
 /// Languages offered in the menu. `System` follows the Windows UI language.
@@ -40,33 +40,46 @@ pub fn system_language() -> Language {
     }
 }
 
-fn resolve(language: Language) -> &'static Lang {
+/// All translation tables, in [`Language`] variant order (System first,
+/// which has no table of its own and resolves to the Windows UI language).
+static TABLES: [&Lang; 10] = [&EN, &ES, &FR, &DE, &PT, &IT, &RU, &JA, &ZH, &KO];
+
+/// Index into [`TABLES`] of the active language. Atomic so `t()` keeps its
+/// `&'static Lang` signature on every thread with no locking.
+static CURRENT: AtomicUsize = AtomicUsize::new(0);
+
+fn index_of(language: Language) -> usize {
     match language {
-        Language::En => &EN,
-        Language::Es => &ES,
-        Language::Fr => &FR,
-        Language::De => &DE,
-        Language::Pt => &PT,
-        Language::It => &IT,
-        Language::Ru => &RU,
-        Language::Ja => &JA,
-        Language::Zh => &ZH,
-        Language::Ko => &KO,
-        Language::System => resolve(system_language()),
+        Language::En => 0,
+        Language::Es => 1,
+        Language::Fr => 2,
+        Language::De => 3,
+        Language::Pt => 4,
+        Language::It => 5,
+        Language::Ru => 6,
+        Language::Ja => 7,
+        Language::Zh => 8,
+        Language::Ko => 9,
+        Language::System => index_of(system_language()),
     }
 }
 
-static LANG: OnceLock<&'static Lang> = OnceLock::new();
-
-/// Fixes the UI language for this process. Call once at startup, before any
-/// menu string is built; later calls are ignored.
+/// Fixes the process language at startup (from the saved setting, falling
+/// back to the Windows UI language).
 pub fn init(language: Language) {
-    let _ = LANG.set(resolve(language));
+    CURRENT.store(index_of(language), Ordering::Relaxed);
+}
+
+/// Switches the process language live: every `t()` read from now on returns
+/// the new table. The tray menu (rebuilt by the language handler) and the
+/// panel (whose labels ride every state snapshot) pick it up immediately.
+pub fn set_language(language: Language) {
+    CURRENT.store(index_of(language), Ordering::Relaxed);
 }
 
 /// The process UI language.
 pub fn t() -> &'static Lang {
-    LANG.get().copied().unwrap_or(&EN)
+    TABLES[CURRENT.load(Ordering::Relaxed)]
 }
 
 pub struct Lang {
@@ -82,6 +95,12 @@ pub struct Lang {
     pub settings: &'static str,
     /// Word before the slot number ("Estático 2" / "Static 2").
     pub static_mode: &'static str,
+    /// Menu entry (and window title context) for the settings panel.
+    pub open_panel: &'static str,
+    /// Dark picker window title.
+    pub pick_color: &'static str,
+    pub accept: &'static str,
+    pub cancel: &'static str,
     pub color: &'static str,
     /// Status line shown when the RGB-strip monitor's desktop is absent.
     pub no_screen: &'static str,
@@ -120,6 +139,21 @@ pub struct Lang {
     /// Engine-failure status lines; {0} is replaced by the error detail.
     pub fail_image: &'static str,
     pub fail_audio: &'static str,
+    /// Panel placeholder for modes without settings of their own.
+    pub no_settings: &'static str,
+    /// Panel hint shown before any lighting mode has been chosen.
+    pub select_mode: &'static str,
+    /// Interactive-manual tooltips, shown when hovering a panel row label.
+    pub hint_brightness: &'static str,
+    pub hint_sampling: &'static str,
+    pub hint_smoothing: &'static str,
+    pub hint_boost: &'static str,
+    pub hint_fps: &'static str,
+    pub hint_static_color: &'static str,
+    pub hint_audio_color: &'static str,
+    pub hint_sensitivity: &'static str,
+    pub hint_blink: &'static str,
+    pub hint_range: &'static str,
 }
 
 pub const ES: Lang = Lang {
@@ -130,6 +164,10 @@ pub const ES: Lang = Lang {
     mode: "Modo",
     settings: "Configuración",
     static_mode: "Estático",
+    pick_color: "Elegir color",
+    accept: "Aceptar",
+    cancel: "Cancelar",
+    open_panel: "Abrir panel",
     color: "Color",
     no_screen: "No se encontró la pantalla LG",
     border5: "Borde (5%)",
@@ -165,6 +203,18 @@ pub const ES: Lang = Lang {
     disconnected: "No conectado",
     fail_image: "Sincronización de imagen no disponible: {0}",
     fail_audio: "Sincronización de audio: captura de audio no disponible: {0}",
+    no_settings: "Este modo no tiene ajustes propios.",
+    select_mode: "Selecciona un modo para ver sus ajustes.",
+    hint_brightness: "Brillo de los LEDs (1-12). Con una sync activa atenúa por software sin detenerla.",
+    hint_sampling: "Zona de pantalla que analizan los LEDs. Cambiarla reinicia la captura (~1 s).",
+    hint_smoothing: "Transición entre fotogramas: Instantáneo reacciona al momento; Alto funde con más suavidad.",
+    hint_boost: "Multiplicador sobre el color medio para realzar escenas oscuras. Muy alto satura.",
+    hint_fps: "Veces por segundo que se actualizan los LEDs. Más FPS, más CPU y tráfico USB.",
+    hint_static_color: "Color de este modo estático: se elige en el selector de Windows y se aplica al momento.",
+    hint_audio_color: "Color de la sync de audio: arcoíris continuo o un color sólido a elegir.",
+    hint_sensitivity: "Cuánto se amplifica el volumen antes de la curva: Baja para salas ruidosas, Alta para silenciosas.",
+    hint_blink: "Cómo sube y decae el brillo con el sonido: Suave envuelve, Normal acompaña, Rápido marca los golpes.",
+    hint_range: "Curva de volumen a brillo: Comprimido levanta lo bajo, Expandido deja solo los picos, Extremo estrobea.",
 };
 
 pub const EN: Lang = Lang {
@@ -175,6 +225,10 @@ pub const EN: Lang = Lang {
     mode: "Mode",
     settings: "Settings",
     static_mode: "Static",
+    pick_color: "Pick a color",
+    accept: "OK",
+    cancel: "Cancel",
+    open_panel: "Open panel",
     color: "Color",
     no_screen: "LG screen not found",
     border5: "Border (5%)",
@@ -210,6 +264,18 @@ pub const EN: Lang = Lang {
     disconnected: "Disconnected",
     fail_image: "Image sync unavailable: {0}",
     fail_audio: "Audio sync: audio capture unavailable: {0}",
+    no_settings: "This mode has no settings of its own.",
+    select_mode: "Select a mode to see its settings.",
+    hint_brightness: "LED brightness (1-12). While a sync runs it dims by software without stopping it.",
+    hint_sampling: "Screen area the LEDs analyze. Changing it restarts the capture (~1 s).",
+    hint_smoothing: "Temporal blend between frames: Instant reacts at once; High fades more smoothly.",
+    hint_boost: "Multiplier over the average color to lift dark scenes. Very high oversaturates.",
+    hint_fps: "How often the LEDs update per second. More FPS means more CPU and USB traffic.",
+    hint_static_color: "This static mode's color: picked in the Windows picker and applied at once.",
+    hint_audio_color: "Audio sync color: a continuous rainbow or a solid color of your choice.",
+    hint_sensitivity: "How much the volume is amplified before the curve: Low for loud rooms, High for quiet ones.",
+    hint_blink: "How brightness rises and decays with sound: Smooth wraps, Normal follows, Fast punches the beats.",
+    hint_range: "Volume-to-brightness curve: Compressed lifts the quiet, Expanded keeps the peaks, Extreme strobes.",
 };
 
 pub const FR: Lang = Lang {
@@ -220,6 +286,10 @@ pub const FR: Lang = Lang {
     mode: "Mode",
     settings: "Paramètres",
     static_mode: "Statique",
+    pick_color: "Choisir une couleur",
+    accept: "OK",
+    cancel: "Annuler",
+    open_panel: "Ouvrir le panneau",
     color: "Couleur",
     no_screen: "Écran LG introuvable",
     border5: "Bord (5%)",
@@ -255,6 +325,18 @@ pub const FR: Lang = Lang {
     disconnected: "Déconnecté",
     fail_image: "Synchronisation d'image indisponible : {0}",
     fail_audio: "Synchronisation audio : capture audio indisponible : {0}",
+    no_settings: "Ce mode n'a pas de réglages propres.",
+    select_mode: "Sélectionnez un mode pour afficher ses réglages.",
+    hint_brightness: "Luminosité des LED (1-12). Pendant une synchro, atténue par logiciel sans l'arrêter.",
+    hint_sampling: "Zone de l'écran analysée par les LED. La modifier relance la capture (~1 s).",
+    hint_smoothing: "Fondu entre images : Instantané réagit aussitôt ; Haut fond plus doucement.",
+    hint_boost: "Multiplicateur sur la couleur moyenne pour éclaircir les scènes sombres. Trop haut sature.",
+    hint_fps: "Nombre d'actualisations des LED par seconde. Plus de FPS = plus de CPU et d'USB.",
+    hint_static_color: "Couleur de ce mode statique : choisie dans le sélecteur Windows, appliquée aussitôt.",
+    hint_audio_color: "Couleur de la sync audio : arc-en-ciel continu ou couleur unie au choix.",
+    hint_sensitivity: "Amplification du volume avant la courbe : Basse pour les pièces bruyantes, Haute pour les calmes.",
+    hint_blink: "Montée et retombée de la luminosité avec le son : Doux enveloppe, Normal suit, Rapide marque les temps.",
+    hint_range: "Courbe volume→luminosité : Compressée relève le faible, Étendue garde les pics, Extrême stroboscope.",
 };
 
 pub const DE: Lang = Lang {
@@ -265,6 +347,10 @@ pub const DE: Lang = Lang {
     mode: "Modus",
     settings: "Einstellungen",
     static_mode: "Statisch",
+    pick_color: "Farbe wählen",
+    accept: "OK",
+    cancel: "Abbrechen",
+    open_panel: "Bedienfeld öffnen",
     color: "Farbe",
     no_screen: "LG-Bildschirm nicht gefunden",
     border5: "Rand (5%)",
@@ -300,6 +386,18 @@ pub const DE: Lang = Lang {
     disconnected: "Getrennt",
     fail_image: "Bildsynchronisation nicht verfügbar: {0}",
     fail_audio: "Audiosynchronisation: Audioaufnahme nicht verfügbar: {0}",
+    no_settings: "Dieser Modus hat keine eigenen Einstellungen.",
+    select_mode: "Wähle einen Modus, um seine Einstellungen zu sehen.",
+    hint_brightness: "LED-Helligkeit (1-12). Bei aktiver Sync wird softwareseitig abgedimmt, ohne sie zu stoppen.",
+    hint_sampling: "Bildschirmbereich, den die LEDs analysieren. Änderung startet die Aufnahme neu (~1 s).",
+    hint_smoothing: "Überblendung zwischen Bildern: Sofort reagiert sofort, Hoch blendet weicher.",
+    hint_boost: "Multiplikator auf der Durchschnittsfarbe für dunkle Szenen. Sehr hoch übersättigt.",
+    hint_fps: "Wie oft die LEDs pro Sekunde aktualisiert werden. Mehr FPS = mehr CPU und USB.",
+    hint_static_color: "Farbe dieses statischen Modus: im Windows-Dialog wählen, sofort aktiv.",
+    hint_audio_color: "Farbe der Audio-Sync: durchlaufender Regenbogen oder eigene Vollfarbe.",
+    hint_sensitivity: "Wie stark die Lautstärke vor der Kurve verstärkt wird: Niedrig für laute, Hoch für leise Räume.",
+    hint_blink: "Anstieg und Abfall der Helligkeit zum Sound: Sanft umhüllt, Normal folgt, Schnell betont Beats.",
+    hint_range: "Kurve von Lautstärke zu Helligkeit: Komprimiert hebt Leises, Extrem wirkt wie Stroboskop.",
 };
 
 pub const PT: Lang = Lang {
@@ -310,6 +408,10 @@ pub const PT: Lang = Lang {
     mode: "Modo",
     settings: "Configurações",
     static_mode: "Estático",
+    pick_color: "Escolher cor",
+    accept: "OK",
+    cancel: "Cancelar",
+    open_panel: "Abrir painel",
     color: "Cor",
     no_screen: "Tela LG não encontrada",
     border5: "Borda (5%)",
@@ -345,6 +447,18 @@ pub const PT: Lang = Lang {
     disconnected: "Desconectado",
     fail_image: "Sincronização de imagem indisponível: {0}",
     fail_audio: "Sincronização de áudio: captura de áudio indisponível: {0}",
+    no_settings: "Este modo não tem ajustes próprios.",
+    select_mode: "Selecione um modo para ver os seus ajustes.",
+    hint_brightness: "Brilho dos LEDs (1-12). Com uma sync ativa, escurece por software sem pará-la.",
+    hint_sampling: "Área da tela analisada pelos LEDs. Mudá-la reinicia a captura (~1 s).",
+    hint_smoothing: "Transição entre quadros: Instantâneo reage na hora; Alto funde mais suave.",
+    hint_boost: "Multiplicador sobre a cor média para realçar cenas escuras. Muito alto satura.",
+    hint_fps: "Quantas vezes por segundo os LEDs atualizam. Mais FPS, mais CPU e tráfego USB.",
+    hint_static_color: "Cor deste modo estático: escolhida no seletor do Windows e aplicada na hora.",
+    hint_audio_color: "Cor da sync de áudio: arco-íris contínuo ou uma cor sólida à sua escolha.",
+    hint_sensitivity: "Quanto o volume é amplificado antes da curva: Baixa para ambientes ruidosos, Alta para silenciosos.",
+    hint_blink: "Como o brilho sobe e cai com o som: Suave envolve, Normal acompanha, Rápido marca as batidas.",
+    hint_range: "Curva de volume para brilho: Comprimida levanta o baixo, Extrema estroba.",
 };
 
 pub const IT: Lang = Lang {
@@ -355,6 +469,10 @@ pub const IT: Lang = Lang {
     mode: "Modalità",
     settings: "Impostazioni",
     static_mode: "Statico",
+    pick_color: "Scegli colore",
+    accept: "OK",
+    cancel: "Annulla",
+    open_panel: "Apri pannello",
     color: "Colore",
     no_screen: "Schermo LG non trovato",
     border5: "Bordo (5%)",
@@ -390,6 +508,18 @@ pub const IT: Lang = Lang {
     disconnected: "Disconnesso",
     fail_image: "Sincronizzazione immagine non disponibile: {0}",
     fail_audio: "Sincronizzazione audio: acquisizione audio non disponibile: {0}",
+    no_settings: "Questa modalità non ha impostazioni proprie.",
+    select_mode: "Seleziona una modalità per vederne le impostazioni.",
+    hint_brightness: "Luminosità dei LED (1-12). Durante una sync attenua via software senza fermarla.",
+    hint_sampling: "Zona dello schermo analizzata dai LED. Modificarla riavvia l'acquisizione (~1 s).",
+    hint_smoothing: "Dissolvenza tra fotogrammi: Istantaneo reagisce subito; Alto sfuma più dolcemente.",
+    hint_boost: "Moltiplicatore sul colore medio per schiarire le scene scure. Troppo alto satura.",
+    hint_fps: "Quante volte al secondo si aggiornano i LED. Più FPS, più CPU e traffico USB.",
+    hint_static_color: "Colore di questa modalità statica: scelta nel selettore di Windows, applicata subito.",
+    hint_audio_color: "Colore della sync audio: arcobaleno continuo o un colore solido a scelta.",
+    hint_sensitivity: "Quanto viene amplificato il volume prima della curva: Bassa per stanze rumorose, Alta per silenziose.",
+    hint_blink: "Come la luminosità sale e scende col suono: Dolce avvolge, Normale segue, Rapido stacca i beat.",
+    hint_range: "Curva volume→luminosità: Compressa alza i suoni bassi, Estrema è uno stroboscopio.",
 };
 
 pub const RU: Lang = Lang {
@@ -400,6 +530,10 @@ pub const RU: Lang = Lang {
     mode: "Режим",
     settings: "Настройки",
     static_mode: "Статический",
+    pick_color: "Выбор цвета",
+    accept: "OK",
+    cancel: "Отмена",
+    open_panel: "Открыть панель",
     color: "Цвет",
     no_screen: "Экран LG не найден",
     border5: "Край (5%)",
@@ -435,6 +569,18 @@ pub const RU: Lang = Lang {
     disconnected: "Отключено",
     fail_image: "Синхронизация изображения недоступна: {0}",
     fail_audio: "Аудиосинхронизация: захват звука недоступен: {0}",
+    no_settings: "У этого режима нет собственных настроек.",
+    select_mode: "Выберите режим, чтобы увидеть его настройки.",
+    hint_brightness: "Яркость LED (1–12). Во время синхронизации затемняет программно, не останавливая её.",
+    hint_sampling: "Область экрана, которую анализируют LED. Изменение перезапускает захват (~1 с).",
+    hint_smoothing: "Плавность перехода между кадрами: «Мгновенно» — сразу, «Высокое» — мягче.",
+    hint_boost: "Множитель среднего цвета для тёмных сцен. Слишком высоко — перенасыщение.",
+    hint_fps: "Сколько раз в секунду обновляются LED. Больше FPS — больше нагрузки на CPU и USB.",
+    hint_static_color: "Цвет этого статического режима: выбирается в системном диалоге и применяется сразу.",
+    hint_audio_color: "Цвет аудиосинхронизации: непрерывная радуга или сплошной цвет на выбор.",
+    hint_sensitivity: "Насколько усиливается громкость перед кривой: низкая — для шумных комнат, высокая — для тихих.",
+    hint_blink: "Как яркость растёт и спадает со звуком: плавно — обволакивает, обычно — следует, быстро — бьёт в такт.",
+    hint_range: "Кривая громкость→яркость: сжатая поднимает тихое, расширенная оставляет пики, экстремальная стробит.",
 };
 
 pub const JA: Lang = Lang {
@@ -445,6 +591,10 @@ pub const JA: Lang = Lang {
     mode: "モード",
     settings: "設定",
     static_mode: "スタティック",
+    pick_color: "色の選択",
+    accept: "OK",
+    cancel: "キャンセル",
+    open_panel: "パネルを開く",
     color: "カラー",
     no_screen: "LGスクリーンが見つかりません",
     border5: "ボーダー (5%)",
@@ -480,6 +630,20 @@ pub const JA: Lang = Lang {
     disconnected: "未接続",
     fail_image: "イメージ同期を利用できません: {0}",
     fail_audio: "オーディオ同期: 音声キャプチャを利用できません: {0}",
+    no_settings: "このモードには個別の設定がありません。",
+    select_mode: "モードを選択すると設定が表示されます。",
+    hint_brightness: "LEDの明るさ（1〜12）。同期中はソフトウェアで減光し、停止しません。",
+    hint_sampling: "LEDが解析する画面の範囲。変更するとキャプチャを再起動します（約1秒）。",
+    hint_smoothing: "フレーム間のなじませ。即時は即反応し、高ほど滑らかに変化します。",
+    hint_boost: "平均色に対する倍率。暗い場面を持ち上げます。高すぎると白飛びします。",
+    hint_fps: "LEDの1秒あたりの更新回数。多いほどCPUとUSBの負荷が増えます。",
+    hint_static_color:
+        "このスタティックモードの色。Windowsのカラーピッカーで選ぶと即座に反映されます。",
+    hint_audio_color: "オーディオ同期の色。連続レインボーか、好きな単色を選べます。",
+    hint_sensitivity: "応答カーブ前の音量の増幅率。騒がしい部屋は低、静かな部屋は高が向きます。",
+    hint_blink:
+        "音に合わせた明るさの立ち上がりと余韻。ゆっくりは包み込み、速いはビートを強調します。",
+    hint_range: "音量→明るさのカーブ。圧縮は小さな音を持ち上げ、極端はストロボのようになります。",
 };
 
 pub const ZH: Lang = Lang {
@@ -490,6 +654,10 @@ pub const ZH: Lang = Lang {
     mode: "模式",
     settings: "设置",
     static_mode: "静态",
+    pick_color: "选择颜色",
+    accept: "OK",
+    cancel: "取消",
+    open_panel: "打开面板",
     color: "颜色",
     no_screen: "未找到 LG 屏幕",
     border5: "边缘 (5%)",
@@ -525,6 +693,18 @@ pub const ZH: Lang = Lang {
     disconnected: "未连接",
     fail_image: "图像同步不可用：{0}",
     fail_audio: "音频同步：音频捕获不可用：{0}",
+    no_settings: "此模式没有单独的设置。",
+    select_mode: "选择一个模式以查看其设置。",
+    hint_brightness: "LED 亮度（1-12）。同步期间以软件方式调暗，不会停止同步。",
+    hint_sampling: "LED 分析的屏幕区域。更改会重启采集（约 1 秒）。",
+    hint_smoothing: "帧之间的过渡：即时立即反应，高则渐变更柔和。",
+    hint_boost: "在平均颜色上相乘，提亮暗场景。过高会过饱和。",
+    hint_fps: "LED 每秒更新次数。FPS 越高，CPU 与 USB 占用越高。",
+    hint_static_color: "此静态模式的颜色：在 Windows 取色器中选择后立即生效。",
+    hint_audio_color: "音频同步的颜色：连续彩虹或自选的纯色。",
+    hint_sensitivity: "响应曲线前对音量的放大程度：吵闹环境用低，安静环境用高。",
+    hint_blink: "亮度随声音的上升与回落：柔和包络，标准跟随，快速强调节拍。",
+    hint_range: "音量到亮度的曲线：压缩提升小声，扩展只留峰值，极端如频闪。",
 };
 
 pub const KO: Lang = Lang {
@@ -535,6 +715,10 @@ pub const KO: Lang = Lang {
     mode: "모드",
     settings: "설정",
     static_mode: "고정",
+    pick_color: "색 선택",
+    accept: "확인",
+    cancel: "취소",
+    open_panel: "패널 열기",
     color: "색상",
     no_screen: "LG 화면을 찾을 수 없음",
     border5: "가장자리 (5%)",
@@ -570,4 +754,17 @@ pub const KO: Lang = Lang {
     disconnected: "연결 안 됨",
     fail_image: "이미지 동기화를 사용할 수 없음: {0}",
     fail_audio: "오디오 동기화: 오디오 캡처를 사용할 수 없음: {0}",
+    no_settings: "이 모드에는 별도의 설정이 없습니다.",
+    select_mode: "설정을 보려면 모드를 선택하세요.",
+    hint_brightness: "LED 밝기(1-12). 동기화 중에는 소프트웨어로 조이며 중단하지 않습니다.",
+    hint_sampling: "LED가 분석하는 화면 영역입니다. 변경하면 캡처를 다시 시작합니다(약 1초).",
+    hint_smoothing: "프레임 간 전환: 즉시는 바로 반응하고, 높음은 더 부드럽게 변합니다.",
+    hint_boost: "평균 색상에 곱해 어두운 장면을 밝힙니다. 너무 높으면 채도가 과해집니다.",
+    hint_fps: "초당 LED 갱신 횟수입니다. 높을수록 CPU와 USB 사용량이 늘어납니다.",
+    hint_static_color: "이 고정 모드의 색상입니다. Windows 색 선택기에서 고르면 즉시 적용됩니다.",
+    hint_audio_color: "오디오 동기화 색상: 연속 무지개 또는 원하는 단색.",
+    hint_sensitivity: "응답 곡선 전 음량 증폭 정도입니다. 시끄러운 방은 낮게, 조용한 방은 높게.",
+    hint_blink:
+        "소리에 따른 밝기 상승과 감쇠입니다. 부드럽게는 감싸고, 빠르게는 비트를 강조합니다.",
+    hint_range: "음량→밝기 곡선입니다. 압축은 작은 소리를 올리고, 극한은 스트로브처럼 깜빡입니다.",
 };

@@ -154,6 +154,33 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
             }
             LRESULT(0)
         }
+        // Debug-only test hook: automated checks can drive real events
+        // (brightness changes, open/close, …) from outside the process
+        // without passing pointers across processes, which WM_APP above
+        // forbids. The event id is looked up by the small integer in
+        // wparam.
+        #[cfg(debug_assertions)]
+        msg if msg == WM_APP + 43 => {
+            let id = match wparam.0 {
+                1 => "bright_5",
+                2 => "bright_12",
+                3 => "open_panel",
+                4 => "mode_1",
+                5 => "toggle_audio",
+                6 => "mode_5",
+                7 => "lang_2",
+                8 => "lang_0",
+                9 => "slotcolor_1",
+                10 => "toggle_image_sync",
+                _ => "",
+            };
+            if !id.is_empty() {
+                if let Ok(mut pending) = PENDING.lock() {
+                    pending.push(id.to_string());
+                }
+            }
+            LRESULT(0)
+        }
         WM_DISPLAYCHANGE => {
             if let Ok(mut pending) = PENDING.lock() {
                 pending.push(CHANGED_EVENT.to_string());

@@ -7,13 +7,15 @@
 //! the checks.
 
 use crate::audio::{AudioColor, Blink, DynamicRange};
-use crate::color_dialog;
 use crate::engine::{
     AudioParams, Engine, ImageSyncParams, Source, AUDIO_SYNC_MODE, ENGINE_FAILED_EVENT,
     VIDEO_SYNC_MODE,
 };
 use crate::events::{self, Events};
-use crate::i18n::{t, Lang, Language};
+use crate::i18n::{self, t, Lang, Language};
+use crate::panel;
+use crate::picker::PickerRequest;
+
 use crate::sampling::SamplingMode;
 use crate::settings::{self, Settings};
 use crate::usb::{self, UsbCommand};
@@ -38,21 +40,21 @@ const RECOVERY_REPEAT_DELAY: Duration = Duration::from_secs(1);
 /// so anything the user changed in the meantime wins.
 const RESTORE_PUSH_EVENT: &str = "__restore_push";
 
-const SMOOTHING: [(Label, f32); 4] = [
+pub(crate) const SMOOTHING: [(Label, f32); 4] = [
     (|l| l.smooth_instant, 0.0),
     (|l| l.smooth_low, 0.2),
     (|l| l.smooth_normal, 0.4),
     (|l| l.smooth_high, 0.6),
 ];
 
-const BOOST: [(Label, f32); 4] = [
+pub(crate) const BOOST: [(Label, f32); 4] = [
     (|_| "1.0x", 1.0),
     (|_| "1.2x", 1.2),
     (|_| "1.5x", 1.5),
     (|_| "2.0x", 2.0),
 ];
 
-const FPS: [(Label, u32); 4] = [
+pub(crate) const FPS: [(Label, u32); 4] = [
     (|_| "10", 10),
     (|_| "15", 15),
     (|_| "30", 30),
@@ -61,7 +63,7 @@ const FPS: [(Label, u32); 4] = [
 
 /// Language menu entries: endonym labels (fixed per language), except the
 /// System entry whose label follows the active language.
-const LANGUAGES: [(&str, Language); 11] = [
+pub(crate) const LANGUAGES: [(&str, Language); 11] = [
     ("", Language::System),
     ("Español", Language::Es),
     ("English", Language::En),
@@ -75,7 +77,7 @@ const LANGUAGES: [(&str, Language); 11] = [
     ("한국어", Language::Ko),
 ];
 
-const GAIN: [(Label, f32); 3] = [
+pub(crate) const GAIN: [(Label, f32); 3] = [
     (|l| l.gain_low, 0.5),
     (|l| l.gain_medium, 1.0),
     (|l| l.gain_high, 2.0),
@@ -98,7 +100,7 @@ const RANGE: [(Label, DynamicRange); 4] = [
 /// Which sync source is running. Both funnel through the event-loop thread,
 /// so a plain field stays consistent.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum SyncActive {
+pub(crate) enum SyncActive {
     None,
     ImageSync,
     Audio,
@@ -112,7 +114,7 @@ pub struct Ui {
     pub tray: Option<TrayIcon>,
     /// Current sync source. All starts/stops funnel through the event-loop
     /// thread, so a plain field stays consistent.
-    sync: SyncActive,
+    pub(crate) sync: SyncActive,
     toggle_image_sync: CheckMenuItem,
     toggle_audio: CheckMenuItem,
     /// One check item per brightness level (1..=12).
@@ -136,7 +138,7 @@ pub struct Ui {
     /// One check item per audio blink / dynamic-range preset.
     audio_blink_items: PresetChecks<Blink>,
     audio_range_items: PresetChecks<DynamicRange>,
-    /// One check item per menu language (the choice applies on next launch).
+    /// One check item per menu language (switching rebuilds the menu live).
     language_items: PresetChecks<Language>,
     autostart_item: CheckMenuItem,
     /// Desktop output of the RGB-strip monitor (the image sync source),
@@ -144,25 +146,41 @@ pub struct Ui {
     /// is not there right now (standby, input switch).
     selected_screen: String,
     /// Sync to resume on the next "turn LEDs on", if the last lighting mode
-    /// was a sync and no static mode has been chosen since.
-    resume: Option<SyncActive>,
+    /// was a sync and no static mode has been chosen since. Also drives the
+    /// panel view while the LEDs are off: it IS the active configuration.
+    pub(crate) resume: Option<SyncActive>,
     /// Image Sync that was running at exit but whose screen was not up yet at
     /// app start (boot race): started on the first topology event reporting
     /// the RGB monitor's output back, or by the next "turn LEDs on". Cleared
     /// by any explicit user choice (static mode, power off, another sync).
-    pending_boot_sync: Option<SyncActive>,
+    /// Also carries a sync picked while the LEDs are off, waiting for power.
+    pub(crate) pending_boot_sync: Option<SyncActive>,
     /// Image Sync tuning, handed to the engine on every (re)start.
-    params: ImageSyncParams,
+    pub(crate) params: ImageSyncParams,
     /// Audio Sync tuning, applied live through the engine's shared slot.
-    audio: AudioParams,
-    /// Saved UI language (applies on next launch).
-    language: Language,
+    pub(crate) audio: AudioParams,
+    /// Last solid audio color picked, remembered so the rainbow sweep can
+    /// be switched off again (None = never picked; restore falls back to
+    /// white). Persisted alongside the color mode.
+    pub(crate) audio_last_solid: Option<[u8; 3]>,
+    /// Active UI language (switching applies live everywhere).
+    pub(crate) language: Language,
     /// Monitor state as last pushed by this app: brightness, device mode and
     /// each static slot's color. None = never pushed this session (the
     /// protocol has no read-back), so nothing is checked until we act.
-    brightness: Option<u8>,
-    mode: Option<u8>,
-    slot_colors: [Option<[u8; 3]>; 4],
+    pub(crate) brightness: Option<u8>,
+    pub(crate) mode: Option<u8>,
+    pub(crate) slot_colors: [Option<[u8; 3]>; 4],
+    /// Last diagnostic line (missing screen, engine failure). Overrides the
+    /// derived status in the panel until the next state change clears it —
+    /// the same stickiness the menu status item has.
+    pub(crate) note: Option<String>,
+    /// Autostart registry state, kept in sync by both toggle surfaces.
+    pub(crate) autostart: bool,
+    /// Whether the strip is lit: the last power action said on (or any
+    /// mode/color command lit it) and no power-off has followed. Session
+    /// only — every launch restores the saved mode, which lights the strip.
+    pub(crate) leds_on: bool,
     pub connected: Arc<AtomicBool>,
     engine: Arc<Engine>,
     /// Sender for the delayed recovery pass (see schedule_recovery_repeat).
@@ -218,6 +236,10 @@ pub fn build_ui(
         blink: settings.audio_blink.unwrap_or(Blink::Normal),
         range: settings.audio_range.unwrap_or(DynamicRange::Normal),
     };
+    let audio_last_solid = settings.audio_solid.or(match audio.color {
+        AudioColor::Solid(rgb) => Some(rgb),
+        AudioColor::Rainbow => None,
+    });
     engine.set_audio_params(audio);
     engine.set_brightness(settings.brightness.unwrap_or(12));
     let (sampling, smoothing, boost, fps) =
@@ -406,7 +428,13 @@ pub fn build_ui(
             fps,
         },
         audio,
+        audio_last_solid,
         language: ui_language,
+        note: None,
+        autostart: settings::autostart_enabled(),
+        // The startup restore re-applies the saved mode, which lights the
+        // strip: the session starts (and the switch shows it) powered on.
+        leds_on: true,
         brightness: settings.brightness,
         mode: settings.mode,
         slot_colors: settings.slot_colors,
@@ -461,6 +489,156 @@ pub fn build_ui(
     ui
 }
 
+/// Recreates every language-dependent menu item from the current state, so
+/// a live language switch can rebuild the tray menu without restarting.
+/// Fixed-text items (the sync toggles) stay as they are, and the sync_menu
+/// diff fields are refreshed to match the fresh icons, so the following
+/// sync_menu call has nothing stale to repaint. Check states come from
+/// `ui`, which mirrors the live state after every event.
+fn recreate_items(ui: &mut Ui) {
+    let mut bright_items: PresetChecks<u8> = Vec::new();
+    for i in 1..=12u8 {
+        bright_items.push((
+            i,
+            CheckMenuItem::with_id(
+                format!("bright_{i}"),
+                format!("{} {i}", t().level),
+                true,
+                ui.brightness == Some(i),
+                None,
+            ),
+        ));
+    }
+
+    let mut mode_items: PresetChecks<u8> = Vec::new();
+    for mode in 1..=6u8 {
+        mode_items.push((
+            mode,
+            CheckMenuItem::with_id(
+                format!("mode_{mode}"),
+                static_mode_name(mode),
+                true,
+                ui.mode == Some(mode),
+                None,
+            ),
+        ));
+    }
+
+    let mut slot_color_items: Vec<(u8, IconMenuItem)> = Vec::new();
+    for slot in 1..=4u8 {
+        slot_color_items.push((
+            slot,
+            IconMenuItem::with_id(
+                format!("slotcolor_{slot}"),
+                format!("Slot {slot}"),
+                true,
+                ui.slot_colors[(slot - 1) as usize].map(swatch_icon),
+                None,
+            ),
+        ));
+    }
+
+    let mut sampling_items: PresetChecks<SamplingMode> = Vec::new();
+    for (mode, key, label) in [
+        (
+            SamplingMode::Border5,
+            "sampling_5",
+            (|l: &Lang| l.border5) as Label,
+        ),
+        (
+            SamplingMode::Border15,
+            "sampling_15",
+            (|l: &Lang| l.border15) as Label,
+        ),
+        (
+            SamplingMode::Full,
+            "sampling_full",
+            (|l: &Lang| l.full_screen) as Label,
+        ),
+    ] {
+        sampling_items.push((
+            mode,
+            CheckMenuItem::with_id(key, label(t()), true, mode == ui.params.sampling, None),
+        ));
+    }
+
+    let smooth_items: PresetChecks<f32> = build_presets(&SMOOTHING, "smooth", ui.params.smoothing);
+    let boost_items: PresetChecks<f32> = build_presets(&BOOST, "boost", ui.params.boost);
+    let fps_items: PresetChecks<u32> = build_presets(&FPS, "fps", ui.params.fps);
+    let gain_items: PresetChecks<f32> = build_presets(&GAIN, "gain", ui.audio.gain);
+    let audio_rainbow_item = CheckMenuItem::with_id(
+        "audiocolor_rainbow",
+        t().rainbow,
+        true,
+        ui.audio.color == AudioColor::Rainbow,
+        None,
+    );
+    let audio_solid_item = IconMenuItem::with_id(
+        "audiocolor_solid",
+        t().solid_color,
+        true,
+        match ui.audio.color {
+            AudioColor::Solid(rgb) => Some(swatch_icon(rgb)),
+            AudioColor::Rainbow => None,
+        },
+        None,
+    );
+    let audio_blink_items: PresetChecks<Blink> =
+        build_presets(&BLINK, "audioblink", ui.audio.blink);
+    let audio_range_items: PresetChecks<DynamicRange> =
+        build_presets(&RANGE, "audiorange", ui.audio.range);
+    let mut language_items: PresetChecks<Language> = Vec::new();
+    for (i, (label, lang)) in LANGUAGES.iter().enumerate() {
+        let text = if *lang == Language::System {
+            t().system
+        } else {
+            *label
+        };
+        language_items.push((
+            *lang,
+            CheckMenuItem::with_id(format!("lang_{i}"), text, true, *lang == ui.language, None),
+        ));
+    }
+
+    let status_item = MenuItem::with_id(
+        "__status",
+        if ui.connected.load(Ordering::SeqCst) {
+            t().connected
+        } else {
+            t().disconnected
+        },
+        false,
+        None,
+    );
+    let mode_sub = Submenu::new(mode_label(ui.sync, ui.mode), true);
+    let autostart_item =
+        CheckMenuItem::with_id("autostart", t().autostart, true, ui.autostart, None);
+
+    ui.bright_items = bright_items;
+    ui.mode_items = mode_items;
+    ui.slot_color_items = slot_color_items;
+    ui.sampling_items = sampling_items;
+    ui.smooth_items = smooth_items;
+    ui.boost_items = boost_items;
+    ui.fps_items = fps_items;
+    ui.gain_items = gain_items;
+    ui.audio_rainbow_item = audio_rainbow_item;
+    ui.audio_solid_item = audio_solid_item;
+    ui.audio_blink_items = audio_blink_items;
+    ui.audio_range_items = audio_range_items;
+    ui.language_items = language_items;
+    ui.status_item = status_item;
+    ui.mode_sub = mode_sub;
+    ui.autostart_item = autostart_item;
+    // The fresh items already carry the current icons: mark the paint
+    // trackers as up to date so sync_menu has nothing stale to redo.
+    ui.painted_slots = ui.slot_colors.map(Some);
+    ui.painted_audio_solid = Some(match ui.audio.color {
+        AudioColor::Solid(rgb) => Some(rgb),
+        AudioColor::Rainbow => None,
+    });
+}
+
 /// Submenu with one appended check item per preset entry.
 fn preset_sub(label: &str, items: &PresetChecks<impl Copy>) -> Submenu {
     let sub = Submenu::new(label, true);
@@ -475,6 +653,9 @@ fn preset_sub(label: &str, items: &PresetChecks<impl Copy>) -> Submenu {
 /// menu visuals).
 pub fn build_menu(ui: &Ui) -> Menu {
     let menu = Menu::new();
+    menu.append(&MenuItem::with_id("open_panel", t().open_panel, true, None))
+        .unwrap();
+    menu.append(&PredefinedMenuItem::separator()).unwrap();
     menu.append(&MenuItem::with_id("on", t().on_leds, true, None))
         .unwrap();
     menu.append(&MenuItem::with_id("off", t().off_leds, true, None))
@@ -555,13 +736,11 @@ pub fn build_menu(ui: &Ui) -> Menu {
     menu
 }
 
-/// Recomputes the two glanceable surfaces (status line + tray tooltip) from
-/// the current state: connection first, then what the app is doing. Call on
-/// every state change that can affect them. No device traffic: safe at any
-/// moment, startup included. Deliberately NOT called after an engine-failure
-/// event — that text must stick until the user acts on it.
-pub fn refresh_status(ui: &mut Ui) {
-    let state = if !ui.connected.load(Ordering::SeqCst) {
+/// The derived status line: connection first, then what the app is doing.
+/// Shared by the tray surfaces and the panel; the panel additionally shows
+/// [`Ui::note`] when a diagnostic is sticking.
+pub(crate) fn status_text(ui: &Ui) -> String {
+    if !ui.connected.load(Ordering::SeqCst) {
         t().disconnected.to_string()
     } else {
         match ui.sync {
@@ -569,7 +748,18 @@ pub fn refresh_status(ui: &mut Ui) {
             SyncActive::Audio => "Audio Sync".to_string(),
             SyncActive::None => t().connected.to_string(),
         }
-    };
+    }
+}
+
+/// Recomputes the two glanceable surfaces (status line + tray tooltip) from
+/// the current state: connection first, then what the app is doing. Call on
+/// every state change that can affect them. No device traffic: safe at any
+/// moment, startup included. Deliberately NOT called after an engine-failure
+/// event — that text must stick until the user acts on it.
+pub fn refresh_status(ui: &mut Ui) {
+    let state = status_text(ui);
+    // A state change supersedes any sticking diagnostic.
+    ui.note = None;
     let tooltip = format!("LG UltraGear RGB Control — {state}");
     if let Some(tray) = &ui.tray {
         let _ = tray.set_tooltip(Some(tooltip));
@@ -583,10 +773,16 @@ pub fn handle_event(id: String, ui: &mut Ui, quit: &mut bool) {
             refresh_status(ui);
             // The monitor just appeared with factory state, and restore
             // commands sent while it was absent were discarded by the USB
-            // worker. Re-push what this app last set (sync modes 7/8 skipped:
-            // a running engine re-arms those on reconnect).
+            // worker. Re-push what this app last set — or, with the LEDs
+            // off, undo the factory lit state the MCU booted into (sync
+            // modes 7/8 skipped: a running engine re-arms those on
+            // reconnect).
             if ui.connected.load(Ordering::SeqCst) {
-                push_device_state(ui);
+                if ui.leds_on {
+                    push_device_state(ui);
+                } else {
+                    ui.engine.send(UsbCommand::TurnOff);
+                }
                 // The reconnection burst can also land on a lighting MCU that
                 // is still booting: schedule the delayed pass.
                 schedule_recovery_repeat(ui);
@@ -638,9 +834,17 @@ pub fn handle_event(id: String, ui: &mut Ui, quit: &mut bool) {
         "toggle_image_sync" => {
             if ui.sync == SyncActive::ImageSync {
                 stop_engine(ui, true);
+            } else if !ui.leds_on {
+                // The strip is dark: record the intent and wait. It starts
+                // (lit) at the next power-on, like the boot-pending sync.
+                ui.engine.stop();
+                ui.resume = None;
+                ui.pending_boot_sync = Some(SyncActive::ImageSync);
+                ui.mode = Some(VIDEO_SYNC_MODE);
             } else if ui.selected_screen.is_empty() {
                 // No RGB-strip monitor on the desktop: nothing to sample.
                 ui.status_item.set_text(t().no_screen);
+                ui.note = Some(t().no_screen.to_string());
             } else {
                 ui.engine.stop();
                 start_sync(ui, SyncActive::ImageSync);
@@ -650,9 +854,34 @@ pub fn handle_event(id: String, ui: &mut Ui, quit: &mut bool) {
         "toggle_audio" => {
             if ui.sync == SyncActive::Audio {
                 stop_engine(ui, true);
+            } else if !ui.leds_on {
+                // Same deferred start as image sync.
+                ui.engine.stop();
+                ui.resume = None;
+                ui.pending_boot_sync = Some(SyncActive::Audio);
+                ui.mode = Some(AUDIO_SYNC_MODE);
             } else {
                 ui.engine.stop();
                 start_sync(ui, SyncActive::Audio);
+            }
+        }
+
+        // The panel window: created lazily on first open, merely shown after.
+        "open_panel" => panel::open(&ui.events),
+
+        // The panel thread can receive snapshots now (first open) or asked
+        // for a refresh (reopen). No state changes here: the common tail
+        // below is what pushes the fresh snapshot.
+        panel::PANEL_READY_EVENT => {}
+
+        // The panel's autostart checkbox. The menu item arm reads muda's
+        // auto-toggled check as its signal; from the panel that item was not
+        // clicked, so toggle from the tracked state instead.
+        "pv_autostart" => {
+            let enable = !ui.autostart;
+            if settings::autostart_set(enable) {
+                ui.autostart = enable;
+                ui.autostart_item.set_checked(enable);
             }
         }
 
@@ -694,7 +923,8 @@ pub fn handle_event(id: String, ui: &mut Ui, quit: &mut bool) {
                     "audio" => t().fail_audio.replace("{0}", err),
                     _ => detail.to_string(),
                 };
-                ui.status_item.set_text(text);
+                ui.status_item.set_text(text.clone());
+                ui.note = Some(text);
                 // The engine gave up on its own (terminal GPU or audio
                 // error): disarm the monitor — it is still armed at sync
                 // brightness and would sit there through the ~12 s sync
@@ -716,6 +946,8 @@ pub fn handle_event(id: String, ui: &mut Ui, quit: &mut bool) {
                     engine.send_blocking(UsbCommand::SetBrightness(level));
                 });
                 ui.mode = Some(1);
+                // The disarm burst leaves the strip lit on Static 1.
+                ui.leds_on = true;
                 // Uncheck so the menu matches reality and a retry from the
                 // menu is possible.
                 ui.sync = SyncActive::None;
@@ -733,6 +965,14 @@ pub fn handle_event(id: String, ui: &mut Ui, quit: &mut bool) {
                 tweak_audio(ui, ui.audio.blink == v, |p| p.blink = v);
             } else if let Some(v) = parse_preset(&id, "audiorange_", &RANGE) {
                 tweak_audio(ui, ui.audio.range == v, |p| p.range = v);
+            } else if let Some(rest) = id.strip_prefix("__picker_slot_") {
+                if let Some((slot, rgb)) = parse_picker_result(rest) {
+                    apply_picked_slot_color(ui, slot, rgb);
+                }
+            } else if let Some(rest) = id.strip_prefix("__picker_audio:") {
+                if let Some(rgb) = parse_picker_rgb(rest) {
+                    select_audio_color(ui, AudioColor::Solid(rgb));
+                }
             } else if let Some(v) = parse_language(&id) {
                 select_language(ui, v);
             } else if let Some(slot) = id
@@ -741,14 +981,30 @@ pub fn handle_event(id: String, ui: &mut Ui, quit: &mut bool) {
             {
                 pick_slot_color(ui, slot);
             } else if id == "audiocolor_rainbow" {
+                // muda auto-toggles the check BEFORE the event, so the check
+                // already reflects the user's intent: turning the sweep off
+                // restores the remembered solid color instead of sticking.
+                if ui.audio_rainbow_item.is_checked() {
+                    select_audio_color(ui, AudioColor::Rainbow);
+                } else {
+                    restore_audio_solid(ui);
+                }
+            } else if id == "pv_audiorainbow_on" {
+                // The panel's switch turning the sweep on (its off path has
+                // its own id; the menu check above is muda-state and the
+                // panel must not depend on it).
                 select_audio_color(ui, AudioColor::Rainbow);
+            } else if id == "audiocolor_solid_restore" {
+                restore_audio_solid(ui);
             } else if id == "audiocolor_solid" {
                 pick_audio_color(ui);
             } else if id == "autostart" {
                 // muda auto-toggles the check item BEFORE the event arrives,
                 // so is_checked() already reflects the user's click.
                 let enable = ui.autostart_item.is_checked();
-                if !settings::autostart_set(enable) {
+                if settings::autostart_set(enable) {
+                    ui.autostart = enable;
+                } else {
                     // Registry write failed: undo muda's visual toggle.
                     ui.autostart_item.set_checked(!enable);
                 }
@@ -786,12 +1042,13 @@ pub fn handle_event(id: String, ui: &mut Ui, quit: &mut bool) {
                         ui.pending_boot_sync = None;
                     }
                     // A monitor left armed in sync mode ignores power
-                    // commands until its ~12 s sync timeout expires. Exiting
-                    // to Static 1 first makes the command effective
-                    // immediately.
+                    // commands until its ~12 s sync timeout expires. Sending
+                    // Static 1 first makes the power-off effective
+                    // immediately. This is a DEVICE-ONLY trick: the active
+                    // mode in the UI stays whatever the user had (a later
+                    // power-on lights that configuration, not Static 1).
                     if was_syncing && matches!(cmd, UsbCommand::TurnOff) {
                         ui.engine.send(UsbCommand::SetMode(1));
-                        ui.mode = Some(1);
                     }
                     // Turning the LEDs on resumes the remembered sync (image
                     // or audio) if that was the last lighting mode.
@@ -829,7 +1086,21 @@ pub fn handle_event(id: String, ui: &mut Ui, quit: &mut bool) {
                         // lighting the LEDs (nothing to do) and plain
                         // power-on.
                         if !(matches!(cmd, UsbCommand::TurnOn) && ui.sync != SyncActive::None) {
-                            ui.engine.send(cmd);
+                            if matches!(cmd, UsbCommand::TurnOn) {
+                                // Power-on lights the ACTIVE configuration:
+                                // power, then the remembered mode and colors
+                                // (the strip may have been reset while off).
+                                ui.engine.send(cmd);
+                                push_device_state(ui);
+                            } else {
+                                // With the LEDs off nothing may light them:
+                                // mode and color picks stay recorded in the
+                                // state and take effect at the next power-on.
+                                let send = ui.leds_on || matches!(cmd, UsbCommand::TurnOff);
+                                if send {
+                                    ui.engine.send(cmd);
+                                }
+                            }
                         }
                     }
                 }
@@ -837,6 +1108,8 @@ pub fn handle_event(id: String, ui: &mut Ui, quit: &mut bool) {
         }
     }
     sync_menu(ui);
+    // The panel mirrors whatever this event changed, menu clicks included.
+    panel::sync(ui);
     // Clicks are rare: no debounce. CONNECTION_EVENT changes no state, so
     // skip the write on connect flaps.
     if id != usb::CONNECTION_EVENT {
@@ -882,6 +1155,7 @@ fn current_settings(ui: &Ui) -> Settings {
         audio_running: ui.sync == SyncActive::Audio,
         audio_gain: Some(ui.audio.gain),
         audio_color: Some(ui.audio.color),
+        audio_solid: ui.audio_last_solid,
         audio_blink: Some(ui.audio.blink),
         audio_range: Some(ui.audio.range),
         language: Some(ui.language),
@@ -994,11 +1268,24 @@ fn tweak_audio(ui: &mut Ui, same: bool, set: impl FnOnce(&mut AudioParams)) {
 }
 
 /// Applies an audio-sync color change live; the loop rebuilds the base
-/// palette from the slot when it sees the new setting.
+/// palette from the slot when it sees the new setting. Solid picks are
+/// remembered, so a later rainbow-off can restore them.
 fn select_audio_color(ui: &mut Ui, v: AudioColor) {
     if ui.audio.color != v {
+        if let AudioColor::Solid(rgb) = v {
+            ui.audio_last_solid = Some(rgb);
+        }
         ui.audio.color = v;
         ui.engine.set_audio_params(ui.audio);
+    }
+}
+
+/// Switches the rainbow sweep off, back to the last solid color picked
+/// (white when none was ever picked). No-op while a solid is showing.
+fn restore_audio_solid(ui: &mut Ui) {
+    if ui.audio.color == AudioColor::Rainbow {
+        let rgb = ui.audio_last_solid.unwrap_or([0xF2, 0xF2, 0xF2]);
+        select_audio_color(ui, AudioColor::Solid(rgb));
     }
 }
 
@@ -1007,6 +1294,8 @@ fn select_audio_color(ui: &mut Ui, v: AudioColor) {
 /// Any start supersedes a sync still pending from app start.
 fn start_sync(ui: &mut Ui, which: SyncActive) {
     ui.pending_boot_sync = None;
+    // Arming the monitor lights the strip, whatever it showed before.
+    ui.leds_on = true;
     match which {
         SyncActive::ImageSync => {
             ui.sync = SyncActive::ImageSync;
@@ -1037,10 +1326,20 @@ fn parse_preset<T: Copy>(id: &str, prefix: &str, table: &[(Label, T)]) -> Option
     table.get(i).map(|&(_, v)| v)
 }
 
-/// Saves the language choice; strings apply on next launch, but the check
-/// moves to the selection right away.
+/// Switches the UI language live: every `t()` read from now on returns the
+/// new table, the tray menu is rebuilt in it and swapped onto the tray, and
+/// the tooltip follows. The panel picks the new labels up through its next
+/// state snapshot (the common tail after this handler pushes one). The
+/// choice persists through the common tail's settings save.
 fn select_language(ui: &mut Ui, v: Language) {
+    i18n::set_language(v);
     ui.language = v;
+    recreate_items(ui);
+    if let Some(tray) = ui.tray.as_ref() {
+        let menu = build_menu(ui);
+        tray.set_menu(Some(Box::new(menu)));
+    }
+    refresh_status(ui);
 }
 
 /// A 16x16 solid-color swatch used as the menu icon of a color entry.
@@ -1054,33 +1353,57 @@ fn swatch_icon([r, g, b]: [u8; 3]) -> Icon {
 
 /// Opens the native color picker and applies the picked color to a static
 /// slot (stored + activated), exactly like a preset click.
+/// Opens the dark picker for a static slot. The pick lands async: the
+/// picker reports back a `__picker_slot_N` event once accepted.
 fn pick_slot_color(ui: &mut Ui, slot: u8) {
     let initial = ui
         .slot_colors
         .get((slot as usize).saturating_sub(1))
         .copied()
-        .flatten();
-    let Some(rgb) = color_dialog::pick_custom_color(initial) else {
-        return; // cancelled: nothing changes
-    };
-    let cmd = UsbCommand::SetStaticColor(slot, rgb[0], rgb[1], rgb[2]);
-    stop_engine(ui, false);
-    apply_command_state(ui, &cmd);
-    ui.resume = None;
-    ui.engine.send(cmd);
+        .flatten()
+        .unwrap_or([255, 255, 255]);
+    panel::open_picker(&ui.events, PickerRequest::Slot(slot, initial));
 }
 
-/// Opens the native color picker; on accept the picked color becomes the
-/// audio sync solid color.
+/// Opens the dark picker for the audio color; on accept the picked color
+/// becomes the audio sync solid color (`__picker_audio` event).
 fn pick_audio_color(ui: &mut Ui) {
     let initial = match ui.audio.color {
         AudioColor::Solid(rgb) => Some(rgb),
         AudioColor::Rainbow => None,
     };
-    let Some(rgb) = color_dialog::pick_custom_color(initial) else {
-        return;
-    };
-    select_audio_color(ui, AudioColor::Solid(rgb));
+    panel::open_picker(&ui.events, PickerRequest::Audio(initial));
+}
+
+/// Applies an accepted picker result for a static slot: same flow as a
+/// preset pick (device disarm, state mirror, resume clearing), deferred
+/// until the picker reports the color.
+fn apply_picked_slot_color(ui: &mut Ui, slot: u8, rgb: [u8; 3]) {
+    let cmd = UsbCommand::SetStaticColor(slot, rgb[0], rgb[1], rgb[2]);
+    stop_engine(ui, false);
+    apply_command_state(ui, &cmd);
+    ui.resume = None;
+    // With the LEDs off the pick stays recorded only: it lights at the
+    // next power-on, with the rest of the active configuration.
+    if ui.leds_on {
+        ui.engine.send(cmd);
+    }
+}
+
+/// Parses "N:R,G,B" from a picker result event.
+fn parse_picker_result(rest: &str) -> Option<(u8, [u8; 3])> {
+    let (slot, rgb) = rest.split_once(':')?;
+    let slot = slot.parse::<u8>().ok()?;
+    parse_picker_rgb(rgb).map(|rgb| (slot, rgb))
+}
+
+/// Parses "R,G,B".
+fn parse_picker_rgb(s: &str) -> Option<[u8; 3]> {
+    let mut it = s.split(',');
+    let r = it.next()?.parse::<u8>().ok()?;
+    let g = it.next()?.parse::<u8>().ok()?;
+    let b = it.next()?.parse::<u8>().ok()?;
+    Some([r, g, b])
 }
 
 fn parse_language(id: &str) -> Option<Language> {
@@ -1089,9 +1412,9 @@ fn parse_language(id: &str) -> Option<Language> {
 }
 
 /// Display name of a device mode 1..=6: translated "Static N"; Peaceful and
-/// Dynamic keep LG's own names. Shared by the mode checks and the Mode
-/// submenu label.
-fn static_mode_name(mode: u8) -> String {
+/// Dynamic keep LG's own names. Shared by the mode checks, the Mode submenu
+/// label and the panel's mode radios.
+pub(crate) fn static_mode_name(mode: u8) -> String {
     match mode {
         1..=4 => format!("{} {mode}", t().static_mode),
         5 => "Peaceful".to_string(),
@@ -1142,15 +1465,12 @@ fn redetect_screen(ui: &mut Ui) {
     }
     ui.selected_screen = detected;
     if ui.selected_screen.is_empty() {
-        ui.status_item.set_text(t().no_screen);
+        let text = t().no_screen;
+        ui.status_item.set_text(text);
+        ui.note = Some(text.to_string());
         return;
     }
-    ui.status_item
-        .set_text(if ui.connected.load(Ordering::SeqCst) {
-            t().connected
-        } else {
-            t().disconnected
-        });
+    refresh_status(ui);
     match ui.sync {
         SyncActive::ImageSync => {
             // A renumbered DeviceName needs a fresh duplication on the new
@@ -1177,6 +1497,13 @@ fn redetect_screen(ui: &mut Ui) {
 /// sync running; reads the CURRENT state, so user changes made after the
 /// power event win.
 fn recover_monitor(ui: &mut Ui) {
+    // With the LEDs off, the strip must come back dark: the freshly booted
+    // MCU lit its factory state, so undo it (and leave every deferred
+    // change waiting for the next power-on).
+    if !ui.leds_on {
+        ui.engine.send(UsbCommand::TurnOff);
+        return;
+    }
     match ui.sync {
         // A controlled engine reinit (frames pause around the re-arm): an
         // out-of-band mode switch landing between two reports of a frame
@@ -1219,11 +1546,23 @@ fn schedule_recovery_repeat(ui: &mut Ui) {
 /// restores the visuals to the real state (covers stale toggles, clicking the
 /// already-selected entry, and state set by the handlers).
 fn sync_menu(ui: &mut Ui) {
-    ui.toggle_image_sync
-        .set_checked(ui.sync == SyncActive::ImageSync);
-    ui.toggle_audio.set_checked(ui.sync == SyncActive::Audio);
+    // A sync chosen while the LEDs are off (pending_boot_sync) shows as
+    // selected too: it is the active configuration, waiting for power-on.
+    ui.toggle_image_sync.set_checked(
+        ui.sync == SyncActive::ImageSync || ui.pending_boot_sync == Some(SyncActive::ImageSync),
+    );
+    ui.toggle_audio.set_checked(
+        ui.sync == SyncActive::Audio || ui.pending_boot_sync == Some(SyncActive::Audio),
+    );
     // The Mode submenu's label tracks the active lighting mode.
-    ui.mode_sub.set_text(mode_label(ui.sync, ui.mode));
+    // A pending (power-deferred) sync names the submenu: it is the active
+    // configuration until the strip is powered.
+    let shown_sync = if ui.sync == SyncActive::None {
+        ui.pending_boot_sync.unwrap_or(ui.sync)
+    } else {
+        ui.sync
+    };
+    ui.mode_sub.set_text(mode_label(shown_sync, ui.mode));
     for (level, item) in &ui.bright_items {
         item.set_checked(ui.brightness == Some(*level));
     }
@@ -1284,6 +1623,8 @@ fn apply_command_state(ui: &mut Ui, cmd: &UsbCommand) {
         UsbCommand::SetMode(mode) => ui.mode = Some(*mode),
         // Pure protocol bookkeeping: no UI state behind it.
         UsbCommand::ArmSync(_) => {}
+        UsbCommand::TurnOn => ui.leds_on = true,
+        UsbCommand::TurnOff => ui.leds_on = false,
         UsbCommand::SetStaticColor(slot, r, g, b) => {
             let idx = (*slot as usize).saturating_sub(1);
             if let Some(c) = ui.slot_colors.get_mut(idx) {
@@ -1291,9 +1632,7 @@ fn apply_command_state(ui: &mut Ui, cmd: &UsbCommand) {
             }
             ui.mode = Some(*slot);
         }
-        UsbCommand::TurnOn
-        | UsbCommand::TurnOff
-        | UsbCommand::StoreStaticColor(..)
+        UsbCommand::StoreStaticColor(..)
         | UsbCommand::SendColors(..)
         | UsbCommand::SetSession(_)
         | UsbCommand::Probe

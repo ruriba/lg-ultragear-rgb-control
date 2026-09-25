@@ -1,5 +1,36 @@
 # Changelog
 
+## v1.4.0 (2026-09-25)
+
+### Fixed
+
+- The MPO staleness watchdog now backs off when a duplication recreation
+  does not restore changing colors (2 → 4 → 8 → 16 s), instead of
+  recreating every ~2 s forever on desktops whose sampled-block colors
+  never change; a recreation that cures a real freeze resets the backoff
+  immediately.
+
+### Added
+
+- Settings UI: a fixed-size window mirroring every tray-menu control
+  (modes, brightness, colors, both syncs' tunings, language,
+  start-with-Windows), opened from the first menu item or a left click on
+  the tray icon and centered on the cursor's monitor. It is a second view
+  of the same state, so menu and window can never disagree; closing it
+  frees its memory and reopening rebuilds it. Its color pickers are dark
+  Slint windows (hue square, hue slider, hex field) replacing the always-
+  light ChooseColor dialog. Picking a language switches
+  the window, the tray menu and the tooltip immediately. Adds the Slint
+  dependency (software renderer, no OpenGL): the exe grows from ~1 MB to
+  ~9 MB, and the project license moves from MIT to GPL-3.0 (Slint's
+  copyleft option; own code remains the author's to relicense).
+- Debug builds open the panel on launch (suppress with
+  `LGTRAY_NO_AUTO_PANEL`) and expose a small message-based test hook for
+  automated checks.
+- Debug builds install a vectored exception handler that logs hard access
+  violations (faulting module, accessed address, symbolic backtrace) —
+  release builds are unaffected.
+
 ## v1.3.0 (2026-09-23)
 
 ### Changed

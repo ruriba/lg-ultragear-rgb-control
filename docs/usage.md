@@ -1,22 +1,73 @@
 # Usage manual
 
-Right-click the tray icon to open the menu. Every change is applied
+A left click on the tray icon opens the settings panel; right-click it to
+open the menu. Every change is applied
 immediately and persisted to `settings.json`; options marked **[restart]**
 restart the sync engine (~1 s pause in the LEDs) because they need new
 capture geometry.
+
+The same controls also live in a settings window — **Open panel**, the first
+menu item. It is a second view of the same state, in a fixed-size window
+(it cannot be resized or maximized): one column picks what the strip does
+(Static 1–4, Peaceful, Dynamic, Image Sync, Audio Sync) — picking the option
+already active is a no-op. The right column always shows brightness, and
+below it a section that follows the active mode: a static mode offers just
+its own color, Image Sync its sampling, smoothing, boost and FPS, Audio
+Sync its sensitivity, color, blink and dynamic range, and the modes without
+settings of their own say so.
+
+![The settings panel, Audio Sync view](img/panel-audio.png)
+
+Static modes and Audio Sync share the same color control — a card showing
+the current color or the rainbow sweep (with its hex or name), opening the
+built-in dark color picker on click — and Audio Sync adds a **Rainbow**
+switch that turns the sweep off again, restoring the last solid color
+picked; its color row comes first.
+
+![Static view with the shared color card](img/panel-static.png)
+
+The color picker opens in the same dark style: a hue square, a hue slider
+and a hex field.
+
+![The color picker](img/picker.png)
+
+Every row follows the same label + control pattern: brightness keeps its
+slider (twelve steps, applied as you drag), every other tuning uses
+segmented pills with the same preset options as the menu (smoothing
+Instant–High, boost 1.0×–2.0×, FPS 10–60, sensitivity Low–High), where all
+options stay visible and one click switches. Tuning changes reach the LEDs
+on the next frame, no engine restart (only a sampling pick restarts the
+capture).
+
+![Image Sync view](img/panel-image.png)
+
+The panel always opens centered on your cursor's monitor, and hovering any
+row's label shows what that setting does in the status bar at the bottom —
+the manual, built into the window. The header holds the **LEDs on/off**
+switch (strip power; same control as the menu's on/off entries) on the
+left and, on the right, the **Start with Windows** switch and the language
+selector; the status bar at the bottom shows the connection state (plus
+any diagnostic). Closing the window destroys it and hands its memory back
+to the system — the next open builds a fresh one showing the current state
+— and the menu keeps working unchanged. Both surfaces mirror each other,
+so a change made from the menu repaints the open panel and vice versa.
 
 With the monitor absent (unplugged, standby, input switch), commands cannot
 reach it, but nothing is lost: the app remembers what you set — modes,
 colors, brightness, sync toggles — and reapplies it automatically when the
 connection returns. A sync started while the monitor is absent simply waits
 and arms itself on reconnection. The status line at the bottom of the menu
-shows the connection state at all times.
+(and the top of the panel) shows the connection state at all times.
 
 ## General controls
 
-- **Turn LEDs on / Turn LEDs off** — powers the monitor's backlight strip.
-  Turning them off stops a running sync but remembers it: the next
-  **Turn LEDs on** resumes the same sync source.
+- **Turn LEDs on / Turn LEDs off** — powers the monitor's backlight strip
+  (the panel's **LEDs on/off** switch is the same control). Turning them
+  off does not change the active mode: the panel stays where it is and
+  every adjustment can still be made — the strip stays dark and each pick
+  is remembered. The next **Turn LEDs on** lights the strip with that
+  active configuration: a sync that was running restarts, and a sync
+  chosen while the LEDs were off starts then.
 - **Brightness ▸ Level 1–12** — LED brightness. On the static modes it sets
   the monitor's backlight level. While a sync runs it dims the LEDs in
   software (the monitor stays at max) and applies within a fraction of a
@@ -91,8 +142,10 @@ user.
 
 ## Language ▸ System / English / Español / …
 
-The menu language. **System** follows the Windows UI language; a specific
-choice applies on the next launch (the check moves immediately).
+The menu language — also selectable from the panel's header combo box.
+**System** follows the Windows UI language; picking a language switches the
+panel, the tray menu and the tooltip immediately (and sticks across
+launches).
 
 ## Status line
 

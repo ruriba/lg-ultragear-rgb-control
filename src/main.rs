@@ -13,12 +13,15 @@
 
 mod audio;
 mod capture;
-mod color_dialog;
 mod compute;
+#[cfg(debug_assertions)]
+mod crash_trace;
 mod engine;
 mod events;
 mod i18n;
 mod menu;
+mod panel;
+mod picker;
 mod sampling;
 mod settings;
 mod stats;
@@ -32,10 +35,12 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 use tray_icon::menu::MenuEvent;
-use tray_icon::TrayIconBuilder;
+use tray_icon::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
 use usb::UsbCommand;
 
 fn main() {
+    #[cfg(debug_assertions)]
+    crash_trace::install();
     install_panic_hook();
     if !acquire_single_instance_lock() {
         return;
@@ -69,6 +74,19 @@ fn main() {
         events.send(ev.id.as_ref().to_string());
     }));
 
+    // A left click on the tray icon opens the panel directly (the menu
+    // stays on the right click, see with_menu_on_left_click above).
+    TrayIconEvent::set_event_handler(Some(move |event: TrayIconEvent| {
+        if let TrayIconEvent::Click {
+            button: MouseButton::Left,
+            button_state: MouseButtonState::Up,
+            ..
+        } = event
+        {
+            events.send("open_panel".to_string());
+        }
+    }));
+
     let state = if ui.connected.load(Ordering::SeqCst) {
         i18n::t().connected
     } else {
@@ -76,6 +94,9 @@ fn main() {
     };
     let tray = TrayIconBuilder::new()
         .with_menu(Box::new(menu))
+        // A left click opens the panel directly; the menu stays on the
+        // right click.
+        .with_menu_on_left_click(false)
         .with_tooltip(format!("LG UltraGear RGB Control — {state}"))
         .with_icon(build_icon())
         .build()
@@ -84,6 +105,20 @@ fn main() {
     // Normalize both glanceable surfaces around the state start_sync left
     // (a resumed sync shows as running, not as the bare connection state).
     refresh_status(&mut ui);
+
+    // Debug builds open the panel straight away: its only other entry point
+    // is the tray menu, which an automated check cannot click. LGTRAY_NO_
+    // AUTO_PANEL suppresses it so tests can exercise the late-open path.
+    #[cfg(debug_assertions)]
+    if std::env::var_os("LGTRAY_NO_AUTO_PANEL").is_none() {
+        events.send("open_panel".to_string());
+    }
+    // Testing affordance (LGTRAY_OPEN_PANEL): same, in release builds, so
+    // automated checks can measure an opened panel without clicking the
+    // tray. Zero cost when the variable is unset.
+    if std::env::var_os("LGTRAY_OPEN_PANEL").is_some() {
+        events.send("open_panel".to_string());
+    }
 
     // Returns when handle_event sets quit (or the loop dies).
     events::pump(&mut ui, handle_event);

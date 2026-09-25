@@ -31,6 +31,9 @@ pub struct Settings {
     pub audio_gain: Option<f32>,
     /// Audio sync color (rainbow sweep or solid). None = rainbow.
     pub audio_color: Option<crate::audio::AudioColor>,
+    /// Last solid audio color picked, so turning the rainbow sweep off can
+    /// restore it. None = never picked (the restore falls back to white).
+    pub audio_solid: Option<[u8; 3]>,
     /// Audio sync temporal envelope. None = Normal.
     pub audio_blink: Option<crate::audio::Blink>,
     /// Audio sync loudness → level curve. None = Normal.

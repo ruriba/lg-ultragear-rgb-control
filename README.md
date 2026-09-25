@@ -8,7 +8,7 @@
   [![CI](https://github.com/ruriba/lg-ultragear-rgb-control/actions/workflows/ci.yml/badge.svg)](https://github.com/ruriba/lg-ultragear-rgb-control/actions/workflows/ci.yml)
   ![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11-0078d7)
   ![Language](https://img.shields.io/badge/language-Rust-DEA584)
-  ![License](https://img.shields.io/badge/license-MIT-green)
+  ![License](https://img.shields.io/badge/license-GPL--3.0-blue)
 </div>
 
 A Windows system-tray application that drives the RGB backlight strip of
@@ -18,6 +18,12 @@ executable — no installer, no services, no account.
 
 ## Features
 
+- **Settings panel** — every control also lives in a modern window
+  ("Open panel" in the tray menu, built with Slint's fluent style): live
+  sliders (brightness, smoothing, boost, FPS, sensitivity — tuning applies
+  on the next frame), mode and sampling radios, color swatches with the
+  native picker, sync switches. Menu and panel mirror each other; closing
+  the window hides it.
 - **Image Sync** — captures the desktop through DXGI (HDR aware) and streams
   the colors of the screen edges (5% or 15% ring) or the whole screen to the
   48 LEDs. Block averaging runs on the GPU (D3D11 compute shader). Zero CPU
@@ -121,7 +127,7 @@ capture of the default output device).
 
 - **Autostart** — launches the app on login (per-user registry `Run` entry).
 - **Language** — follows the system UI language by default; a fixed choice
-  applies on the next launch.
+  switches the panel and tray menu immediately and persists.
 - **Status line** — shows the connection state and the last diagnostic.
 - **Quit** — stops any sync, leaves the monitor on the static mode you
   selected (Static 1 if none) and exits; the next launch resumes exactly
@@ -184,4 +190,7 @@ Electronics in any way. Use at your own risk.
 
 ## License
 
-[MIT](LICENSE)
+[GPL-3.0](LICENSE). Own code was MIT until v1.4; the
+UI toolkit ([Slint](https://slint.dev)) is GPL-3.0 OR Royalty-Free OR
+commercial, and GPL-3.0 was chosen for the project. The USB protocol
+notes in `docs/protocol.md` are factual documentation, free to reuse.
