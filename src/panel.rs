@@ -1239,6 +1239,12 @@ thread_local! {
 /// — and returns the pages to the OS. The event loop keeps running for
 /// later opens and pickers.
 fn close_panel() {
+    // The picker is an auxiliary of the surface it was opened from: when
+    // the panel goes away, a picker opened from it must not survive as an
+    // orphaned window — route it through its own teardown (the same path
+    // as its X). A picker opened from the tray menu with the panel closed
+    // is unaffected: nothing here runs for it.
+    crate::picker::close_picker();
     PANEL_HWND.store(0, Ordering::SeqCst);
     *CURRENT.lock().unwrap() = None;
     WINDOW_OPEN.store(false, Ordering::SeqCst);

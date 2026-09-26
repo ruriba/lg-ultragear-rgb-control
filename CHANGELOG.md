@@ -8,6 +8,9 @@
   again: the X bypassed the picker's teardown, leaving a hidden window
   that every later open silently retargeted instead of showing. The X now
   follows the same path as the Cancel button.
+- Closing the settings panel now also closes a color picker that is still
+  open, instead of leaving it behind as an orphaned window. A picker
+  opened from the tray menu (no panel) is unaffected.
 
 ## v1.5.0 (2026-09-26)
 
