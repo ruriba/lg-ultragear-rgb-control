@@ -260,10 +260,10 @@ impl Engine {
     /// `SetSession(dead)` travels the control channel, which is FIFO per
     /// sender — it lands before any manual command the same thread enqueues
     /// afterwards — and the USB worker drains the control channel before
-    /// servicing any frame, so even a frame already sitting in the frame
-    /// queue (or one the dying session enqueues a moment later through its
-    /// check→send race) is discarded by the session gate instead of
-    /// overwriting the user's command.
+    /// servicing any frame, so even a frame already sitting in the
+    /// latest-frame slot (or one the dying session publishes a moment later
+    /// through its check→send race) is discarded by the session gate
+    /// instead of overwriting the user's command.
     pub fn stop(&self) {
         // dead > any live session: the next start gets dead+1
         let dead = self.state.session.fetch_add(1, Ordering::SeqCst) + 1;

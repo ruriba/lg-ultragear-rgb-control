@@ -7,8 +7,9 @@
 //!   queued String events.
 //! - USB worker: owns the HidApi instance, reconnects in the background
 //! - engine thread (0..1): image sync capture; frames go to the USB worker
-//!   through a small lossy frame queue, while commands travel a separate
-//!   ordered control channel the worker always services first (usb.rs).
+//!   through a latest-wins slot (only the newest colors are ever written),
+//!   while commands travel a separate ordered control channel the worker
+//!   always services first (usb.rs).
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
@@ -57,8 +58,9 @@ fn main() {
     // Two planes to the USB worker: commands travel a reliable ordered
     // channel the worker drains before any frame, so a manual command is
     // never stuck behind (nor overtaken by) sync frames; frames travel a
-    // tiny bounded queue and are dropped when the writer is backed up. See
-    // usb.rs for the full contract.
+    // latest-wins slot — a newer frame overwrites an unconsumed one, so a
+    // backed-up writer never replays stale colors. See usb.rs for the full
+    // contract.
     let (bus, bus_rx) = usb::command_bus();
     let connected = Arc::new(AtomicBool::new(false));
     let engine = Arc::new(Engine::new(bus, connected.clone(), events));

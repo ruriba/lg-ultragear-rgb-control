@@ -102,6 +102,16 @@ Slint:
 
 Closed decisions (don't reopen without new evidence):
 
+- The USB worker is one thread owning the only `HidDevice`: that single
+  ownership is what makes ordering between control commands and sync frames
+  deterministic. No second worker, no per-command writer threads.
+- Sync frames are latest-wins by design (one slot, `usb.rs`): intermediate
+  colors have no value once a newer frame exists. The frame FIFO that
+  preceded the slot was removed 2026-09 and the bus re-validated on
+  hardware.
+- Capture stays on D3D11: the measured per-frame cost is driver/DXGI
+  dominated and GPU-side sampling already minimizes PCIe traffic, so a DX12
+  migration would only add synchronization surface, not speed.
 - Tray stays on muda — tray-icon couples through muda's `ContextMenu`
   trait. A hand-rolled `Shell_NotifyIcon` + `TrackPopupMenu` tray is a
   parked v1.5 idea, not a regression.

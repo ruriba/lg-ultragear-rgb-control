@@ -321,12 +321,15 @@ fn usb_loop(
                     device.is_some(),
                     session.active
                 );
-                let ok = if session.accepts(frame.session) {
-                    usb_protocol::send_sync_colors(dev, &frame.colors, frame.audio)
-                } else {
-                    true
-                };
-                on_write(ok, &mut fails, &mut device, connected, events);
+                // A discarded frame says nothing about device health: it
+                // must neither count as a failure nor reset the
+                // write-failure streak (a stale take during a session switch
+                // used to clear a growing run and delay the reconnect by a
+                // few more failing writes).
+                if session.accepts(frame.session) {
+                    let ok = usb_protocol::send_sync_colors(dev, &frame.colors, frame.audio);
+                    on_write(ok, &mut fails, &mut device, connected, events);
+                }
             }
             Recv::Tick => {
                 maintain(
