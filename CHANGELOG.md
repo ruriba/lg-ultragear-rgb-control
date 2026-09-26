@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- Closing the color picker with the window's X made it impossible to open
+  again: the X bypassed the picker's teardown, leaving a hidden window
+  that every later open silently retargeted instead of showing. The X now
+  follows the same path as the Cancel button.
+
 ## v1.5.0 (2026-09-26)
 
 ### Fixed

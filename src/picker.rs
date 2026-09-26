@@ -9,7 +9,7 @@ use crate::events::Events;
 use crate::i18n::t;
 use std::cell::RefCell;
 
-use slint::ComponentHandle;
+use slint::{CloseRequestResponse, ComponentHandle};
 
 /// What the picker edits and which color it starts from. Target 0 is the
 /// Audio Sync color; 1..=4 is a static slot.
@@ -150,11 +150,15 @@ pub fn show_picker(events: &Events, request: PickerRequest) {
         PickerRequest::Audio(rgb) => (0, rgb.unwrap_or([255, 255, 255])),
     };
 
-    // Already open: retarget it to the new row and reset to its color.
+    // Already open: retarget it to the new row and reset to its color. The
+    // show() heals a window left hidden without a proper close (the X used
+    // to bypass close_picker and leave an invisible picker stuck in the
+    // slot, unopenable forever); on a visible window it is a no-op.
     PICKER_WIN.with(|w| {
         if let Some(p) = w.borrow().as_ref() {
             p.set_target(target);
             set_initial(p, initial);
+            p.show().ok();
         }
     });
     if PICKER_WIN.with(|w| w.borrow().is_some()) {
@@ -177,6 +181,14 @@ pub fn show_picker(events: &Events, request: PickerRequest) {
     let ev = *events;
     picker.on_accept(move || {
         let _ = ev;
+    });
+    // The window-frame X must take the same path as Cancel: the default
+    // close behavior only HIDES the window, leaving the live handle in
+    // PICKER_WIN — the retarget branch above would then never reshow it.
+    // KeepWindowShown because close_picker hides (and drops) by itself.
+    picker.window().on_close_requested(|| {
+        close_picker();
+        CloseRequestResponse::KeepWindowShown
     });
     picker.on_cancel(close_picker);
 
