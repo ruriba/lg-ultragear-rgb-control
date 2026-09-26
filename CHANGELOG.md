@@ -9,7 +9,10 @@
   behind (or be overtaken by) queued frames while the USB writer is busy,
   and stale frames from a stopped sync are dropped before they could
   overwrite a manual change. Shutdown sequences no longer spawn helper
-  threads to keep their order.
+  threads to keep their order. Sync frames themselves now live in a
+  latest-wins slot — only the newest colors are ever written to the
+  device, so a temporarily busy USB link never replays stale intermediate
+  frames.
 - Audio Sync now identifies the default output device by its WASAPI
   endpoint ID instead of its friendly name, so a device switch is detected
   even when both devices share a name (or one was renamed).

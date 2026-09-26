@@ -58,7 +58,7 @@ Every module opens with a `//!` header that says more than this list.
 - `usb.rs` — USB worker thread; owns the single `HidApi` instance, handles
   re-plug detection via device-interface notifications. Commands and frames
   travel separate planes: a reliable ordered control channel the worker
-  drains before any frame, and a tiny lossy frame queue (see `command_bus`).
+  drains before any frame, and a latest-wins frame slot (see `command_bus`).
 - `usb_protocol.rs` — packet format (mirrored in docs/protocol.md).
 - `settings.rs` — JSON settings file kept next to the exe. Rapid-fire UI
   changes save through a Win32-timer debounce (events.rs owns the timer;

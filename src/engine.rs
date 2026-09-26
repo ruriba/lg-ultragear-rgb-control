@@ -220,8 +220,8 @@ impl Engine {
     /// on the bus's control channel: reliable, ordered per sender, and never
     /// blocking — the USB worker drains it before any sync frame, so neither
     /// a wedged writer nor a frame backlog can delay a manual command, and no
-    /// fallback thread is ever needed. `SendColors` (never sent by the menu)
-    /// routes to the lossy frame path.
+    /// fallback thread is ever needed. Frames travel their own latest-wins
+    /// slot ([`CommandTx::frame`]) and never this path.
     pub fn send(&self, cmd: UsbCommand) {
         self.bus.control(cmd);
     }
@@ -655,6 +655,8 @@ fn image_sync_loop(
     let mut dedup_skips = 0u64;
     let mut sends = 0u64;
     let mut keepalives = 0u64;
+    // Frames superseded by a newer publish before the USB worker took them
+    // (the worker is behind: only the newest colors were worth a write).
     let mut queue_full = 0u64;
     let mut recreates = 0u64;
     let mut stale_recreates = 0u64;
@@ -809,10 +811,10 @@ fn image_sync_loop(
                     last_sent = Some(decision.colors);
                     last_send = Instant::now();
                     sends += 1;
-                    // Lossy offer: if the USB writer is stalled we drop this
-                    // frame instead of ever building a backlog of stale
-                    // colors.
-                    if !bus.frame(mine, decision.colors, false) {
+                    // Latest-wins publish: if the worker has not taken the
+                    // previous frame yet, this one supersedes it — no
+                    // backlog of stale colors can ever build up.
+                    if bus.frame(mine, decision.colors, false) {
                         queue_full += 1;
                     }
                 } else {
@@ -853,7 +855,7 @@ fn image_sync_loop(
                     let out = dim_colors(colors, lvl);
                     last_sent = Some(out);
                     last_send = Instant::now();
-                    if !bus.frame(mine, out, false) {
+                    if bus.frame(mine, out, false) {
                         queue_full += 1;
                     }
                 }
@@ -884,7 +886,7 @@ fn image_sync_loop(
                     break;
                 }
                 keepalives += 1;
-                if !bus.frame(mine, *colors, false) {
+                if bus.frame(mine, *colors, false) {
                     queue_full += 1;
                 }
             }

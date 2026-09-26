@@ -146,8 +146,8 @@ capture of the default output device).
   channel that the worker always services before any sync frame — so a
   manual action never queues behind frames, and a stopped sync's stale
   frames (dropped by session tokens) can never overwrite a manual command —
-  while frames travel a tiny lossy queue where only the newest colors
-  matter.
+  while frames travel a latest-wins slot: only the newest colors are ever
+  written, intermediate frames are coalesced away.
 - Hardware overlay planes (MPO) can freeze the duplicated image while the
   desktop moves on; a staleness watchdog recreates the duplication when that
   is detected.

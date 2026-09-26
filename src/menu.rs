@@ -1668,11 +1668,9 @@ fn apply_command_state(ui: &mut Ui, cmd: &UsbCommand) {
             ui.mode = Some(*slot);
         }
         UsbCommand::StoreStaticColor(..)
-        | UsbCommand::SendColors(..)
         | UsbCommand::SetSession(_)
         | UsbCommand::Probe
-        | UsbCommand::Stop
-        | UsbCommand::Wake => {}
+        | UsbCommand::Stop => {}
     }
 }
 
