@@ -142,8 +142,12 @@ capture of the default output device).
 - A DXGI desktop duplication feeds each frame to a compute shader that
   averages 48 sample blocks on the GPU; identical frames are deduplicated
   and the last colors are resent every 5 s to keep the monitor in sync mode.
-- Session tokens on the shared USB command FIFO drop stale frames, so a
-  stopped sync can never overwrite a manual command.
+- USB traffic is split in two planes: commands travel a reliable ordered
+  channel that the worker always services before any sync frame — so a
+  manual action never queues behind frames, and a stopped sync's stale
+  frames (dropped by session tokens) can never overwrite a manual command —
+  while frames travel a tiny lossy queue where only the newest colors
+  matter.
 - Hardware overlay planes (MPO) can freeze the duplicated image while the
   desktop moves on; a staleness watchdog recreates the duplication when that
   is detected.

@@ -17,11 +17,11 @@ use windows::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, PROCESS_PER_MONITOR_DPI_AWARE,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
-    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, PostMessageW, RegisterClassW,
-    RegisterDeviceNotificationW, TranslateMessage, DBT_DEVICEARRIVAL, DBT_DEVICEREMOVECOMPLETE,
-    DBT_DEVTYP_DEVICEINTERFACE, DEV_BROADCAST_DEVICEINTERFACE_W, DEV_BROADCAST_HDR, MSG,
-    PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND, WINDOW_EX_STYLE, WM_APP, WM_DEVICECHANGE,
-    WM_DISPLAYCHANGE, WM_POWERBROADCAST, WNDCLASSW, WS_OVERLAPPEDWINDOW,
+    CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, KillTimer, PostMessageW,
+    RegisterClassW, RegisterDeviceNotificationW, SetTimer, TranslateMessage, DBT_DEVICEARRIVAL,
+    DBT_DEVICEREMOVECOMPLETE, DBT_DEVTYP_DEVICEINTERFACE, DEV_BROADCAST_DEVICEINTERFACE_W,
+    DEV_BROADCAST_HDR, MSG, PBT_APMRESUMEAUTOMATIC, PBT_APMRESUMESUSPEND, WINDOW_EX_STYLE, WM_APP,
+    WM_DEVICECHANGE, WM_DISPLAYCHANGE, WM_POWERBROADCAST, WM_TIMER, WNDCLASSW, WS_OVERLAPPEDWINDOW,
 };
 
 /// UserEvent fired whenever the display topology changes.
@@ -34,6 +34,19 @@ pub const RESUME_EVENT: &str = "__resumed";
 /// (WM_DEVICECHANGE): wakes the USB worker for an immediate presence check
 /// instead of its next poll.
 pub const DEVICE_EVENT: &str = "__device_event";
+
+/// UserEvent fired when the settings-save debounce elapses: the handler
+/// writes settings.json once, no matter how many changes coalesced into
+/// the window.
+pub const SETTINGS_FLUSH_EVENT: &str = "__settings_flush";
+
+/// Timer id of the settings-save debounce (arbitrary; unique on this
+/// window).
+const SETTINGS_TIMER_ID: usize = 1;
+/// Settings-save debounce window: long enough to swallow a full slider
+/// drag, short enough that a hard process kill loses at most this much of
+/// the last change.
+const SETTINGS_DEBOUNCE_MS: u32 = 750;
 
 /// Events received but not yet dispatched. The wndproc only ever enqueues;
 /// dispatch happens in the pump loop, where `&mut Ui` is held — modal dialogs
@@ -63,6 +76,23 @@ impl Events {
             .is_err()
         {
             drop(unsafe { Box::from_raw(boxed) });
+        }
+    }
+
+    /// (Re)starts the settings-save debounce. Repeated calls within the
+    /// window reset it — Win32 timers with the same id replace themselves —
+    /// so a slider drag coalesces into one SETTINGS_FLUSH_EVENT, roughly
+    /// [`SETTINGS_DEBOUNCE_MS`] after the last change. No thread, no
+    /// polling: the timer is a message-queue feature of the window this
+    /// pump already serves.
+    pub fn schedule_settings_flush(&self) {
+        unsafe {
+            SetTimer(
+                Some(self.hwnd),
+                SETTINGS_TIMER_ID,
+                SETTINGS_DEBOUNCE_MS,
+                None,
+            );
         }
     }
 }
@@ -172,6 +202,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 8 => "lang_0",
                 9 => "slotcolor_1",
                 10 => "toggle_image_sync",
+                11 => "quit",
                 _ => "",
             };
             if !id.is_empty() {
@@ -219,6 +250,19 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: 
                 }
             }
             LRESULT(1)
+        }
+        // The settings-save debounce elapsed: one flush event, then the
+        // timer dies (one-shot semantics on top of Win32's repeating
+        // timers). Foreign timers are none of ours; the default proc keeps
+        // them alive for their owner.
+        WM_TIMER if wparam.0 == SETTINGS_TIMER_ID => {
+            unsafe {
+                let _ = KillTimer(Some(hwnd), SETTINGS_TIMER_ID);
+            }
+            if let Ok(mut pending) = PENDING.lock() {
+                pending.push(SETTINGS_FLUSH_EVENT.to_string());
+            }
+            LRESULT(0)
         }
         _ => DefWindowProcW(hwnd, msg, wparam, lparam),
     }

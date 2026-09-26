@@ -1,16 +1,15 @@
-//! Image Sync engine: one session mechanism, one USB channel, one source (the
-//! sampled screen). At most one engine thread runs at any time; manual menu
-//! commands always take precedence over frames.
+//! Image Sync engine: one session mechanism, one USB command bus, one source
+//! (the sampled screen). At most one engine thread runs at any time; manual
+//! menu commands always take precedence over frames.
 
 use crate::audio::{self, AudioColor, Blink, DynamicRange};
 use crate::capture::{CaptureError, Capturer};
 use crate::events::Events;
 use crate::sampling::{self, SamplingMode};
 use crate::stats::StatsLog;
-use crate::usb::UsbCommand;
+use crate::usb::{CommandTx, UsbCommand};
 use crate::usb_protocol::RGBColor;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
-use std::sync::mpsc::{SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -167,7 +166,7 @@ impl EngineState {
 
 pub struct Engine {
     state: Arc<EngineState>,
-    tx: SyncSender<UsbCommand>,
+    bus: CommandTx,
     image_params: Arc<Mutex<ImageSyncParams>>,
     audio_params: Arc<Mutex<AudioParams>>,
     /// Brightness level 1..=12, applied by the engine as software dimming.
@@ -179,7 +178,7 @@ pub struct Engine {
 }
 
 impl Engine {
-    pub fn new(tx: SyncSender<UsbCommand>, connected: Arc<AtomicBool>, events: Events) -> Self {
+    pub fn new(bus: CommandTx, connected: Arc<AtomicBool>, events: Events) -> Self {
         Self {
             state: Arc::new(EngineState {
                 running: AtomicBool::new(false),
@@ -187,7 +186,7 @@ impl Engine {
                 display_changed: AtomicBool::new(false),
                 reinit_requested: AtomicBool::new(false),
             }),
-            tx,
+            bus,
             image_params: Arc::new(Mutex::new(ImageSyncParams::default())),
             audio_params: Arc::new(Mutex::new(AudioParams::default())),
             brightness: Arc::new(AtomicU8::new(SYNC_BRIGHTNESS)),
@@ -217,26 +216,14 @@ impl Engine {
             .store(level.clamp(1, SYNC_BRIGHTNESS), Ordering::Relaxed);
     }
 
-    /// Non-blocking send for callers on the UI thread: a wedged USB writer
-    /// can keep the FIFO full for seconds and the tray must never freeze on
-    /// it. A full FIFO hands the command to a transient thread instead.
+    /// Non-blocking send for callers on the UI thread. Control commands land
+    /// on the bus's control channel: reliable, ordered per sender, and never
+    /// blocking — the USB worker drains it before any sync frame, so neither
+    /// a wedged writer nor a frame backlog can delay a manual command, and no
+    /// fallback thread is ever needed. `SendColors` (never sent by the menu)
+    /// routes to the lossy frame path.
     pub fn send(&self, cmd: UsbCommand) {
-        if let Err(TrySendError::Full(cmd)) = self.tx.try_send(cmd) {
-            let tx = self.tx.clone();
-            thread::spawn(move || {
-                let _ = tx.send(cmd);
-            });
-        }
-    }
-
-    /// Blocking send for shutdown sequences: unlike [`Engine::send`] this
-    /// never spawns a fallback thread, so several commands issued from one
-    /// thread keep their FIFO order even when the channel is full (a parked
-    /// sender is always admitted before a later direct send). Only for
-    /// callers already off the UI thread — it blocks — and the quit
-    /// watchdog bounds the wait.
-    pub fn send_blocking(&self, cmd: UsbCommand) {
-        let _ = self.tx.send(cmd);
+        self.bus.control(cmd);
     }
 
     /// Starts the given sync source, unless the engine is already running.
@@ -248,7 +235,7 @@ impl Engine {
         }
         let mine = self.state.session.fetch_add(1, Ordering::SeqCst) + 1;
         let state = self.state.clone();
-        let tx = self.tx.clone();
+        let bus = self.bus.clone();
         let image_params = self.image_params.clone();
         let audio_params = self.audio_params.clone();
         let brightness = self.brightness.clone();
@@ -257,7 +244,7 @@ impl Engine {
         thread::spawn(move || {
             run(
                 source,
-                tx,
+                bus,
                 image_params,
                 audio_params,
                 brightness,
@@ -270,10 +257,13 @@ impl Engine {
     }
 
     /// Stops the engine and invalidates the session IN THE USB THREAD TOO.
-    /// `SetSession(dead)` travels through the same FIFO channel the menu uses,
-    /// so it lands before any manual command enqueued afterwards; any late
-    /// `SendColors` from the old session is then discarded by the USB thread.
-    /// (Without this, one in-flight frame could overwrite the user's command.)
+    /// `SetSession(dead)` travels the control channel, which is FIFO per
+    /// sender — it lands before any manual command the same thread enqueues
+    /// afterwards — and the USB worker drains the control channel before
+    /// servicing any frame, so even a frame already sitting in the frame
+    /// queue (or one the dying session enqueues a moment later through its
+    /// check→send race) is discarded by the session gate instead of
+    /// overwriting the user's command.
     pub fn stop(&self) {
         // dead > any live session: the next start gets dead+1
         let dead = self.state.session.fetch_add(1, Ordering::SeqCst) + 1;
@@ -308,7 +298,7 @@ impl Engine {
 #[allow(clippy::too_many_arguments)]
 fn run(
     source: Source,
-    tx: SyncSender<UsbCommand>,
+    bus: CommandTx,
     image_params: Arc<Mutex<ImageSyncParams>>,
     audio_params: Arc<Mutex<AudioParams>>,
     brightness: Arc<AtomicU8>,
@@ -367,7 +357,7 @@ fn run(
         UsbCommand::SetMode(mode),
     ];
     for cmd in alive {
-        if !state.is_valid(mine) || tx.send(cmd).is_err() {
+        if !state.is_valid(mine) || !bus.control(cmd) {
             return;
         }
     }
@@ -383,7 +373,7 @@ fn run(
     // a count swallowed while the MCU was still busy switching is what
     // leaves every sync frame applying only its first chunk. One
     // single-report command, still before the first frame.
-    if !state.is_valid(mine) || tx.send(UsbCommand::ArmSync(mode)).is_err() {
+    if !state.is_valid(mine) || !bus.control(UsbCommand::ArmSync(mode)) {
         return;
     }
 
@@ -392,7 +382,7 @@ fn run(
             &screen,
             &image_params,
             &brightness,
-            &tx,
+            &bus,
             &events,
             &connected,
             &state,
@@ -400,7 +390,7 @@ fn run(
         ),
         Source::Audio => audio_loop(
             &audio_params,
-            &tx,
+            &bus,
             &brightness,
             &events,
             &connected,
@@ -425,11 +415,11 @@ fn reinit_commands(mode: u8) -> [UsbCommand; 3] {
 /// Re-arms the device for `mode`: the init sequence, the arming settle, and
 /// a re-assert of the chunk count once the MCU is quiet. Shared by both
 /// loops so their reinit paths can never diverge. Returns false when the
-/// session was superseded or the USB writer went away: the caller must
+/// session was superseded or the USB worker went away: the caller must
 /// return immediately.
-fn rearm(tx: &SyncSender<UsbCommand>, state: &EngineState, mine: u64, mode: u8) -> bool {
+fn rearm(bus: &CommandTx, state: &EngineState, mine: u64, mode: u8) -> bool {
     for cmd in reinit_commands(mode) {
-        if !state.is_valid(mine) || tx.send(cmd).is_err() {
+        if !state.is_valid(mine) || !bus.control(cmd) {
             return false;
         }
     }
@@ -437,7 +427,7 @@ fn rearm(tx: &SyncSender<UsbCommand>, state: &EngineState, mine: u64, mode: u8) 
     // Re-assert the chunk count now that the mode switch has settled: a
     // count swallowed while the MCU was busy leaves frames applying only
     // their first chunk.
-    if !state.is_valid(mine) || tx.send(UsbCommand::ArmSync(mode)).is_err() {
+    if !state.is_valid(mine) || !bus.control(UsbCommand::ArmSync(mode)) {
         return false;
     }
     state.is_valid(mine)
@@ -615,7 +605,7 @@ fn image_sync_loop(
     screen: &str,
     image_params: &Mutex<ImageSyncParams>,
     brightness: &AtomicU8,
-    tx: &SyncSender<UsbCommand>,
+    bus: &CommandTx,
     events: &Events,
     connected: &AtomicBool,
     state: &EngineState,
@@ -711,7 +701,7 @@ fn image_sync_loop(
             ));
         }
         if reinit_needed {
-            if !rearm(tx, state, mine, VIDEO_SYNC_MODE) {
+            if !rearm(bus, state, mine, VIDEO_SYNC_MODE) {
                 return;
             }
             reinit_needed = false;
@@ -773,10 +763,11 @@ fn image_sync_loop(
                 }
                 // A stop can land while AcquireNextFrame blocked (up to
                 // ACQUIRE_TIMEOUT_MS): re-validate before anything is
-                // enqueued from this arm, so this session's frame cannot slip
-                // past the stop's SetSession — which may still be parked on a
-                // full FIFO — and land on top of the user's command. Same
-                // contract as the audio loop's pre-send check.
+                // enqueued from this arm, so this session's frame cannot
+                // compute past the stop and land as a zombie on the bus —
+                // even then the control channel's SetSession would gate it
+                // out in the worker. Same contract as the audio loop's
+                // pre-send check.
                 if !state.is_valid(mine) {
                     break;
                 }
@@ -818,12 +809,10 @@ fn image_sync_loop(
                     last_sent = Some(decision.colors);
                     last_send = Instant::now();
                     sends += 1;
-                    // try_send: if the USB writer is stalled we drop this
+                    // Lossy offer: if the USB writer is stalled we drop this
                     // frame instead of ever building a backlog of stale
                     // colors.
-                    if let Err(TrySendError::Full(_)) =
-                        tx.try_send(UsbCommand::SendColors(mine, decision.colors, false))
-                    {
+                    if !bus.frame(mine, decision.colors, false) {
                         queue_full += 1;
                     }
                 } else {
@@ -864,9 +853,7 @@ fn image_sync_loop(
                     let out = dim_colors(colors, lvl);
                     last_sent = Some(out);
                     last_send = Instant::now();
-                    if let Err(TrySendError::Full(_)) =
-                        tx.try_send(UsbCommand::SendColors(mine, out, false))
-                    {
+                    if !bus.frame(mine, out, false) {
                         queue_full += 1;
                     }
                 }
@@ -897,9 +884,7 @@ fn image_sync_loop(
                     break;
                 }
                 keepalives += 1;
-                if let Err(TrySendError::Full(_)) =
-                    tx.try_send(UsbCommand::SendColors(mine, *colors, false))
-                {
+                if !bus.frame(mine, *colors, false) {
                     queue_full += 1;
                 }
             }
@@ -990,7 +975,7 @@ fn audio_base(color: AudioColor) -> [RGBColor; 48] {
 #[allow(clippy::too_many_arguments)] // the loop plumbing
 fn audio_loop(
     audio_params: &Mutex<AudioParams>,
-    tx: &SyncSender<UsbCommand>,
+    bus: &CommandTx,
     brightness: &AtomicU8,
     events: &Events,
     connected: &AtomicBool,
@@ -1056,7 +1041,7 @@ fn audio_loop(
             reinit_needed = true;
         }
         if reinit_needed {
-            if !rearm(tx, state, mine, AUDIO_SYNC_MODE) {
+            if !rearm(bus, state, mine, AUDIO_SYNC_MODE) {
                 return;
             }
             reinit_needed = false;
@@ -1117,7 +1102,7 @@ fn audio_loop(
         if last_sent.as_ref() != Some(&colors) {
             last_sent = Some(colors);
             last_send = Instant::now();
-            let _ = tx.try_send(UsbCommand::SendColors(mine, colors, true));
+            bus.frame(mine, colors, true);
         }
         // Keepalive: the monitor reverts out of sync mode after ~12 s without
         // frames (measured on hardware). Whenever nothing has been sent for
@@ -1125,7 +1110,7 @@ fn audio_loop(
         // frame to keep it armed.
         if last_send.elapsed() >= SYNC_KEEPALIVE {
             if let Some(colors) = &last_sent {
-                let _ = tx.try_send(UsbCommand::SendColors(mine, *colors, true));
+                bus.frame(mine, *colors, true);
             }
             last_send = Instant::now();
         }

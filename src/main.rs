@@ -6,8 +6,9 @@
 //!   connection changes, display-topology changes and engine failures as
 //!   queued String events.
 //! - USB worker: owns the HidApi instance, reconnects in the background
-//! - engine thread (0..1): image sync capture; frames go to
-//!   the USB worker through one bounded FIFO channel shared with commands.
+//! - engine thread (0..1): image sync capture; frames go to the USB worker
+//!   through a small lossy frame queue, while commands travel a separate
+//!   ordered control channel the worker always services first (usb.rs).
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
@@ -32,11 +33,9 @@ use engine::Engine;
 use menu::{build_menu, build_ui, handle_event, refresh_status};
 use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc;
 use std::sync::Arc;
 use tray_icon::menu::MenuEvent;
 use tray_icon::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
-use usb::UsbCommand;
 
 fn main() {
     #[cfg(debug_assertions)]
@@ -55,15 +54,15 @@ fn main() {
     // tray is created right away and early events simply queue up.
     let events = events::init().expect("failed to create message window");
 
-    // One bounded FIFO for commands AND frames: manual commands may block
-    // briefly on send, frames always use try_send and get dropped when the
-    // USB writer is backed up. Deep enough (8) that the startup restore
-    // burst (brightness + 4 slots) never needs a transient-thread send,
-    // which would race the engine's init for FIFO order.
-    let (tx, rx) = mpsc::sync_channel::<UsbCommand>(8);
+    // Two planes to the USB worker: commands travel a reliable ordered
+    // channel the worker drains before any frame, so a manual command is
+    // never stuck behind (nor overtaken by) sync frames; frames travel a
+    // tiny bounded queue and are dropped when the writer is backed up. See
+    // usb.rs for the full contract.
+    let (bus, bus_rx) = usb::command_bus();
     let connected = Arc::new(AtomicBool::new(false));
-    let engine = Arc::new(Engine::new(tx.clone(), connected.clone(), events));
-    let usb_handle = usb::spawn_usb_thread(rx, connected.clone(), events);
+    let engine = Arc::new(Engine::new(bus, connected.clone(), events));
+    let usb_handle = usb::spawn_usb_thread(bus_rx, connected.clone(), events);
 
     let mut ui = build_ui(engine, connected, settings, events);
     let menu = build_menu(&ui);
@@ -122,6 +121,11 @@ fn main() {
 
     // Returns when handle_event sets quit (or the loop dies).
     events::pump(&mut ui, handle_event);
+
+    // Belt-and-braces final settings write: the quit handler saves, but a
+    // pump exit without it (WM_QUIT from outside) would otherwise drop a
+    // debounced save still waiting on its timer. Dedup makes this free.
+    menu::flush_settings(&ui);
 
     // Bounded: ~1 s per queued write at worst, so this join cannot hang —
     // unless a HID write itself never completes (stalled device): a blocked

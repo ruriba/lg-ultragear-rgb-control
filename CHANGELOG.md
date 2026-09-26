@@ -1,5 +1,26 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- USB commands now travel a dedicated ordered channel that the worker
+  always services before sync frames: a manual action can no longer wait
+  behind (or be overtaken by) queued frames while the USB writer is busy,
+  and stale frames from a stopped sync are dropped before they could
+  overwrite a manual change. Shutdown sequences no longer spawn helper
+  threads to keep their order.
+- Audio Sync now identifies the default output device by its WASAPI
+  endpoint ID instead of its friendly name, so a device switch is detected
+  even when both devices share a name (or one was renamed).
+
+### Changed
+
+- Settings writes are debounced for rapid changes (the panel's brightness
+  slider): one disk write about 0.75 s after the drag ends instead of one
+  per step. Discrete actions still save immediately, and anything pending
+  is flushed on exit.
+
 ## v1.4.0 (2026-09-25)
 
 ### Fixed

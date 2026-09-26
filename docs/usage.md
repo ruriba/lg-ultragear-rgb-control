@@ -2,7 +2,8 @@
 
 A left click on the tray icon opens the settings panel; right-click it to
 open the menu. Every change is applied
-immediately and persisted to `settings.json`; options marked **[restart]**
+immediately and persisted to `settings.json` (rapid slider changes coalesce
+into one write shortly after the drag ends); options marked **[restart]**
 restart the sync engine (~1 s pause in the LEDs) because they need new
 capture geometry.
 

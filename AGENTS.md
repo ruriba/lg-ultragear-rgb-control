@@ -56,9 +56,13 @@ Every module opens with a `//!` header that says more than this list.
 - `sampling.rs` — pure color math and LED-to-screen geometry.
 - `audio.rs` — WASAPI loopback loudness → color, one value per frame.
 - `usb.rs` — USB worker thread; owns the single `HidApi` instance, handles
-  re-plug detection via device-interface notifications.
+  re-plug detection via device-interface notifications. Commands and frames
+  travel separate planes: a reliable ordered control channel the worker
+  drains before any frame, and a tiny lossy frame queue (see `command_bus`).
 - `usb_protocol.rs` — packet format (mirrored in docs/protocol.md).
-- `settings.rs` — JSON settings file kept next to the exe.
+- `settings.rs` — JSON settings file kept next to the exe. Rapid-fire UI
+  changes save through a Win32-timer debounce (events.rs owns the timer;
+  menu.rs owns the policy).
 - `i18n.rs` — struct-per-language so a missing key breaks the build; live
   language switching rebuilds the menu and panel. `LANGUAGES` starts with
   `System` at index 0 — mind the indexing.

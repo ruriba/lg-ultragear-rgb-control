@@ -468,8 +468,8 @@ pub fn build_ui(
     }
 
     // Resume image sync or audio if either was running at exit. Their init
-    // lands after the restore commands in the FIFO, overriding them — mirror
-    // that in the state like the toggle handlers do.
+    // lands after the restore commands on the control channel, overriding
+    // them — mirror that in the state like the toggle handlers do.
     if settings.image_sync_running {
         if ui.selected_screen.is_empty() {
             // No RGB-strip monitor on the desktop (typically a boot race):
@@ -803,6 +803,13 @@ pub fn handle_event(id: String, ui: &mut Ui, quit: &mut bool) {
             schedule_recovery_repeat(ui);
         }
 
+        // The settings-save debounce fired: persist the current state. The
+        // persist tail classifies this id as Skip, so this arm is the only
+        // write for a debounced change.
+        events::SETTINGS_FLUSH_EVENT => {
+            settings::save(&current_settings(ui));
+        }
+
         events::CHANGED_EVENT => redetect_screen(ui),
 
         // An HID device interface arrived or left (keyboard and mice count
@@ -887,10 +894,11 @@ pub fn handle_event(id: String, ui: &mut Ui, quit: &mut bool) {
 
         "quit" => {
             ui.engine.stop();
-            // Ordered restore+Stop off the UI thread: a wedged writer must
-            // never freeze the tray on exit. The kick makes the USB worker
-            // process both immediately.
-            let engine = ui.engine.clone();
+            // Ordered restore+Stop: control sends are FIFO per sender and
+            // never block, so the whole sequence leaves the UI thread in
+            // order with nothing to spawn. Mode before brightness,
+            // consistent with the other disarm sequences (brightness lands
+            // even while armed — hardware-verified).
             let level = ui.brightness.unwrap_or(12);
             // Keep an explicitly selected static mode across exit; only sync
             // modes (and a never-set state) fall back to Static 1 to disarm.
@@ -898,18 +906,9 @@ pub fn handle_event(id: String, ui: &mut Ui, quit: &mut bool) {
                 Some(m) if (1..=6).contains(&m) => m,
                 _ => 1,
             };
-            thread::spawn(move || {
-                // Ordered blocking sends: Engine::send's per-command fallback
-                // threads have unspecified admission order when the FIFO is
-                // full, so Stop could overtake the restore and leave the
-                // monitor armed at sync brightness. Mode before brightness,
-                // consistent with the other disarm sequences (brightness
-                // lands even while armed — hardware-verified). The 5 s quit
-                // watchdog bounds the blocking.
-                engine.send_blocking(UsbCommand::SetMode(restore_mode));
-                engine.send_blocking(UsbCommand::SetBrightness(level));
-                engine.send_blocking(UsbCommand::Stop);
-            });
+            ui.engine.send(UsbCommand::SetMode(restore_mode));
+            ui.engine.send(UsbCommand::SetBrightness(level));
+            ui.engine.send(UsbCommand::Stop);
             *quit = true;
         }
 
@@ -932,19 +931,15 @@ pub fn handle_event(id: String, ui: &mut Ui, quit: &mut bool) {
                 // brightness while it stays armed (same order as
                 // stop_engine).
                 ui.resume = None;
-                // Ordered blocking sends off the UI thread, like quit:
-                // Engine::send's per-command fallback threads have
-                // unspecified admission order when the FIFO is full. Mode
-                // first, then brightness — the same disarm sequence as
-                // stop_engine (hardware-verified: brightness commands land
-                // even while the monitor stays armed in a sync mode, so the
-                // order is consistency rather than a requirement).
-                let engine = ui.engine.clone();
+                // Ordered control sends straight from the UI thread: FIFO
+                // per sender, never blocking. Mode first, then brightness —
+                // the same disarm sequence as stop_engine
+                // (hardware-verified: brightness commands land even while
+                // the monitor stays armed in a sync mode, so the order is
+                // consistency rather than a requirement).
                 let level = ui.brightness.unwrap_or(12);
-                thread::spawn(move || {
-                    engine.send_blocking(UsbCommand::SetMode(1));
-                    engine.send_blocking(UsbCommand::SetBrightness(level));
-                });
+                ui.engine.send(UsbCommand::SetMode(1));
+                ui.engine.send(UsbCommand::SetBrightness(level));
                 ui.mode = Some(1);
                 // The disarm burst leaves the strip lit on Static 1.
                 ui.leds_on = true;
@@ -1021,10 +1016,12 @@ pub fn handle_event(id: String, ui: &mut Ui, quit: &mut bool) {
                         ui.engine.send(cmd);
                     }
                 } else {
-                    // Manual command wins: stop() invalidates the session IN
-                    // THE USB THREAD before this command is enqueued, so no
-                    // in-flight image sync frame can land after it and
-                    // overwrite it.
+                    // Manual command wins: stop() enqueued SetSession(dead)
+                    // on the control channel ahead of this command, and the
+                    // USB worker drains the control channel before any
+                    // frame, so no sync frame — queued, in flight, or
+                    // enqueued late by the dying session — can execute
+                    // after it and overwrite it.
                     let was_syncing = ui.sync != SyncActive::None;
                     stop_engine(ui, false);
                     apply_command_state(ui, &cmd);
@@ -1110,19 +1107,61 @@ pub fn handle_event(id: String, ui: &mut Ui, quit: &mut bool) {
     sync_menu(ui);
     // The panel mirrors whatever this event changed, menu clicks included.
     panel::sync(ui);
-    // Clicks are rare: no debounce. CONNECTION_EVENT changes no state, so
-    // skip the write on connect flaps.
-    if id != usb::CONNECTION_EVENT {
-        settings::save(&current_settings(ui));
+    persist(ui, &id);
+}
+
+/// Persistence tail of every event: UI and hardware already applied the
+/// change by the time this runs; only the disk write is scheduled here.
+/// Discrete events write now, rapid-fire ones defer through the debounce
+/// timer (see [`save_policy`]), stateless events never write.
+fn persist(ui: &Ui, id: &str) {
+    match save_policy(id) {
+        SavePolicy::Now => settings::save(&current_settings(ui)),
+        SavePolicy::Debounced => ui.events.schedule_settings_flush(),
+        SavePolicy::Skip => {}
     }
 }
 
-/// Sends this app's last-known monitor state through the FIFO: brightness,
-/// each stored slot color (store-only, no mode switch) and the saved mode.
-/// Sync modes 7/8 are excluded — they only make sense behind a running
-/// engine, whose init re-arms them. Used at startup and whenever the monitor
-/// (re)appears, since commands sent while it was absent were discarded by
-/// the USB worker.
+/// Which side of the settings-save debounce an event falls on.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SavePolicy {
+    /// Write settings.json now.
+    Now,
+    /// Restart the debounce; the flush event performs the write when it
+    /// fires (~750 ms after the last change).
+    Debounced,
+    /// No settings state behind this event: never write.
+    Skip,
+}
+
+/// The save policy per event id. Only the panel's brightness slider emits a
+/// burst of events for one user gesture (one per step of a drag, each a
+/// different JSON document — the content dedup cannot eat those); every
+/// other control is a discrete click.
+fn save_policy(id: &str) -> SavePolicy {
+    match id {
+        // Connect flaps change no settings. The flush event saves in its own
+        // arm, so writing again here would only lean on the content dedup.
+        usb::CONNECTION_EVENT | events::SETTINGS_FLUSH_EVENT => SavePolicy::Skip,
+        _ if id.starts_with("bright_") => SavePolicy::Debounced,
+        _ => SavePolicy::Now,
+    }
+}
+
+/// Final write after the message pump exits: a normal quit already saved in
+/// its handler, but a pump exit without the quit event would otherwise drop
+/// a debounced save still waiting on its timer. The content dedup makes
+/// this free when nothing is pending.
+pub fn flush_settings(ui: &Ui) {
+    settings::save(&current_settings(ui));
+}
+
+/// Sends this app's last-known monitor state through the control channel:
+/// brightness, each stored slot color (store-only, no mode switch) and the
+/// saved mode. Sync modes 7/8 are excluded — they only make sense behind a
+/// running engine, whose init re-arms them. Used at startup and whenever the
+/// monitor (re)appears, since commands sent while it was absent were
+/// discarded by the USB worker.
 fn push_device_state(ui: &Ui) {
     // During sync the device sits at brightness 12 and the engine dims in
     // software — pushing the user's level here would fight the engine.
@@ -1176,20 +1215,16 @@ fn stop_engine(ui: &mut Ui, restore_static1: bool) {
         // An explicit static restore cancels the resume memory.
         ui.resume = None;
         // Leave the sync mode first, then restore brightness — the disarm
-        // sequence every stop path uses. Both travel one ordered blocking
-        // sequence off the UI thread, like quit: Engine::send's per-command
-        // fallback threads have unspecified admission order when the FIFO is
-        // full. (Hardware-verified: brightness lands even while the monitor
-        // stays armed, so mode-first is consistency, not a requirement.)
-        let engine = ui.engine.clone();
+        // sequence every stop path uses. Control sends keep their order off
+        // the UI thread without spawning anything. (Hardware-verified:
+        // brightness lands even while the monitor stays armed, so
+        // mode-first is consistency, not a requirement.)
         let level = ui.brightness.unwrap_or(12);
         let restore_brightness = was != SyncActive::None;
-        thread::spawn(move || {
-            engine.send_blocking(UsbCommand::SetMode(1));
-            if restore_brightness {
-                engine.send_blocking(UsbCommand::SetBrightness(level));
-            }
-        });
+        ui.engine.send(UsbCommand::SetMode(1));
+        if restore_brightness {
+            ui.engine.send(UsbCommand::SetBrightness(level));
+        }
         ui.mode = Some(1);
     } else if was != SyncActive::None {
         // Restore the device brightness for the static modes that follow
@@ -1636,7 +1671,8 @@ fn apply_command_state(ui: &mut Ui, cmd: &UsbCommand) {
         | UsbCommand::SendColors(..)
         | UsbCommand::SetSession(_)
         | UsbCommand::Probe
-        | UsbCommand::Stop => {}
+        | UsbCommand::Stop
+        | UsbCommand::Wake => {}
     }
 }
 
@@ -1654,4 +1690,47 @@ fn parse_manual_command(id: &str) -> Option<UsbCommand> {
         return n.parse::<u8>().ok().map(UsbCommand::SetMode);
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rapid_controls_defer_discrete_actions_save_now() {
+        // The brightness slider's burst of events (one per drag step, each a
+        // different JSON document): deferred through the debounce timer.
+        assert_eq!(save_policy("bright_7"), SavePolicy::Debounced);
+        assert_eq!(save_policy("bright_12"), SavePolicy::Debounced);
+        // Discrete user actions: written immediately, quit included (that
+        // write is the final flush of any pending debounce).
+        for id in [
+            "mode_3",
+            "on",
+            "off",
+            "toggle_image_sync",
+            "toggle_audio",
+            "smooth_2",
+            "boost_1",
+            "fps_3",
+            "gain_0",
+            "audioblink_1",
+            "audiorange_2",
+            "sampling_5",
+            "lang_4",
+            "autostart",
+            "pv_autostart",
+            "open_panel",
+            "slotcolor_3",
+            "audiocolor_solid",
+            "__picker_slot_2:10,20,30",
+            "__picker_audio:1,2,3",
+            "quit",
+        ] {
+            assert_eq!(save_policy(id), SavePolicy::Now, "{id}");
+        }
+        // Stateless events never write; the flush event saves in its own arm.
+        assert_eq!(save_policy(usb::CONNECTION_EVENT), SavePolicy::Skip);
+        assert_eq!(save_policy(events::SETTINGS_FLUSH_EVENT), SavePolicy::Skip);
+    }
 }

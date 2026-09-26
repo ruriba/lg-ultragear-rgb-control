@@ -6,16 +6,23 @@
 //! below as a fallback for missed notifications. Connection changes are
 //! published to the UI via the event proxy.
 //!
-//! Commands and sync frames share one bounded FIFO, and every queued message
-//! wakes the worker immediately. Frames are enqueued with try_send: if the
-//! writer ever falls behind, the frames it cannot take are dropped instead of
-//! piling up, so the backlog is bounded at four frames.
+//! Commands travel a two-plane bus ([`command_bus`]):
+//!
+//! - The **control plane** — everything except sync frames — is a reliable
+//!   ordered channel. The worker drains it to exhaustion before servicing
+//!   any frame, so a manual command can never be overtaken by a sync frame
+//!   nor wait behind a frame backlog, and a stop's `SetSession` invalidates
+//!   old frames before they could overwrite what the user just set.
+//! - The **data plane** is a tiny bounded frame queue. Producers offer
+//!   frames with try_send and frames the USB writer cannot take are simply
+//!   dropped — only the freshest colors matter, so there is never a backlog
+//!   of stale frames to drain.
 
 use crate::events::Events;
 use crate::usb_protocol::{self, RGBColor};
 use hidapi::{HidApi, HidDevice};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{Receiver, RecvTimeoutError};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, SyncSender, TryRecvError};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -44,8 +51,13 @@ const RECONNECT_EVERY: Duration = Duration::from_secs(2);
 const PRESENCE_PROBE_EVERY: Duration = Duration::from_secs(120);
 /// Consecutive write failures before dropping the device handle.
 const MAX_FAILS: u32 = 5;
+/// Depth of the bounded frame queue. Four frames is ~130 ms of headroom at
+/// 30 fps against a transiently busy writer; beyond that the frames are
+/// stale anyway (the next one carries fresher colors), so they are dropped
+/// instead of queued.
+const FRAME_QUEUE: usize = 4;
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub enum UsbCommand {
     /// Registers the active image sync session: frames from other sessions are
     /// discarded by the USB thread.
@@ -68,13 +80,18 @@ pub enum UsbCommand {
     /// the same recovery work as the periodic cadences, without the wait.
     Probe,
     Stop,
+    /// Data-plane-only wake token: control-plane enqueues push one through
+    /// the frame channel so a worker blocked there (its only blocking wait)
+    /// drains the command immediately. Never executed; consumed by
+    /// [`recv_next`].
+    Wake,
 }
 
 /// The worker's session bookkeeping, extracted so its ordering guarantees
-/// are unit-testable: registration is monotonic (a SetSession parked in
-/// Engine::send's fallback thread can never regress the active session and
-/// permanently discard a newer session's frames), and only the registered
-/// session's frames pass through to the device.
+/// are unit-testable: registration is monotonic (a late `SetSession` from a
+/// superseded stop can never regress the active session and permanently
+/// discard a newer session's frames), and only the registered session's
+/// frames pass through to the device.
 #[derive(Default)]
 struct SessionGate {
     active: u64,
@@ -92,18 +109,135 @@ impl SessionGate {
     }
 }
 
+/// The sending half of the USB command bus. Cloned freely (menu, engine
+/// threads); every clone sends through the same two channels.
+#[derive(Clone)]
+pub struct CommandTx {
+    ctrl: Sender<UsbCommand>,
+    frames: SyncSender<UsbCommand>,
+}
+
+/// The receiving half, handed once to [`spawn_usb_thread`].
+pub struct CommandRx {
+    ctrl: Receiver<UsbCommand>,
+    frames: Receiver<UsbCommand>,
+}
+
+/// Creates the USB command bus: one control plane and one data plane (see
+/// the module docs). The worker owns the receiving halves; the sending half
+/// ends up in the `Engine`, which shares it with the menu and its session
+/// threads.
+pub fn command_bus() -> (CommandTx, CommandRx) {
+    let (ctrl_tx, ctrl_rx) = std::sync::mpsc::channel();
+    let (frame_tx, frame_rx) = std::sync::mpsc::sync_channel(FRAME_QUEUE);
+    (
+        CommandTx {
+            ctrl: ctrl_tx,
+            frames: frame_tx,
+        },
+        CommandRx {
+            ctrl: ctrl_rx,
+            frames: frame_rx,
+        },
+    )
+}
+
+impl CommandTx {
+    /// Enqueues a control command. Reliable and ordered per channel, and
+    /// never blocking: the control plane is unbounded and sized by
+    /// user-scale event rates (menu clicks, engine init bursts), so a
+    /// command never needs a fallback thread and a wedged writer can never
+    /// freeze a sender. Frames handed here by mistake route to the lossy
+    /// data plane. Returns false only when the worker is gone.
+    pub fn control(&self, cmd: UsbCommand) -> bool {
+        match cmd {
+            UsbCommand::SendColors(session, colors, audio) => {
+                self.frame(session, colors, audio);
+                true
+            }
+            cmd => {
+                let queued = self.ctrl.send(cmd).is_ok();
+                // Wake the worker: its only blocking wait is on the frame
+                // channel, so every control enqueue pokes it through there.
+                // The poke fails only when the frame queue is full — and
+                // then the worker is demonstrably busy draining frames, and
+                // drains the control plane before servicing the next frame
+                // anyway. No poke, no lost wakeup, in every combination.
+                let _ = self.frames.try_send(UsbCommand::Wake);
+                queued
+            }
+        }
+    }
+
+    /// Offers one sync frame to the data plane: dropped when the USB writer
+    /// is backed up (a stale frame is worthless — the next one carries
+    /// fresher colors, so only the backlog is bounded, never the latency of
+    /// what follows). Returns whether the frame was queued.
+    pub fn frame(&self, session: u64, colors: [RGBColor; 48], audio: bool) -> bool {
+        self.frames
+            .try_send(UsbCommand::SendColors(session, colors, audio))
+            .is_ok()
+    }
+}
+
 pub fn spawn_usb_thread(
-    rx: Receiver<UsbCommand>,
+    rx: CommandRx,
     connected: Arc<AtomicBool>,
     events: Events,
 ) -> JoinHandle<()> {
     thread::Builder::new()
         .name("usb-worker".into())
-        .spawn(move || usb_loop(rx, &connected, &events))
+        .spawn(move || {
+            let CommandRx { ctrl, frames } = rx;
+            usb_loop(ctrl, frames, &connected, &events)
+        })
         .expect("failed to spawn USB thread")
 }
 
-fn usb_loop(rx: Receiver<UsbCommand>, connected: &AtomicBool, events: &Events) {
+/// What [`recv_next`] decided the worker should service.
+#[derive(Debug)]
+enum Recv {
+    /// A command from either plane.
+    Cmd(UsbCommand),
+    /// Nothing arrived for one cadence tick: run the periodic maintenance.
+    Tick,
+    /// Every sender is gone: the process is shutting down.
+    Done,
+}
+
+/// The worker's receive step — the whole scheduling policy of the bus, kept
+/// standalone so its ordering guarantees are unit-testable.
+///
+/// The control plane is drained to exhaustion first: anything enqueued there
+/// (a stop's `SetSession`, a manual command, the quit `Stop`) is serviced
+/// before any frame, however saturated the frame queue is. Only when the
+/// control plane is empty does the worker take one message off the frame
+/// channel — a frame to execute, or a `Wake` left by a control enqueue,
+/// which just loops back into the drain. The blocking wait carries the
+/// maintenance cadence as its timeout, exactly like the worker's single
+/// channel did before the split.
+fn recv_next(ctrl: &Receiver<UsbCommand>, frames: &Receiver<UsbCommand>, tick: Duration) -> Recv {
+    loop {
+        match ctrl.try_recv() {
+            Ok(cmd) => return Recv::Cmd(cmd),
+            Err(TryRecvError::Empty) => {}
+            Err(TryRecvError::Disconnected) => return Recv::Done,
+        }
+        match frames.recv_timeout(tick) {
+            Ok(UsbCommand::Wake) => continue,
+            Ok(cmd) => return Recv::Cmd(cmd),
+            Err(RecvTimeoutError::Timeout) => return Recv::Tick,
+            Err(RecvTimeoutError::Disconnected) => return Recv::Done,
+        }
+    }
+}
+
+fn usb_loop(
+    ctrl_rx: Receiver<UsbCommand>,
+    frame_rx: Receiver<UsbCommand>,
+    connected: &AtomicBool,
+    events: &Events,
+) {
     // HidApi::new can fail transiently (USB stack still settling at logon).
     // Retrying on the reconnect cadence keeps the worker alive; returning
     // here would silently no-op every menu action for the process lifetime.
@@ -126,15 +260,14 @@ fn usb_loop(rx: Receiver<UsbCommand>, connected: &AtomicBool, events: &Events) {
     }
 
     loop {
-        // Every queued message wakes the receive immediately.
         let tick = if device.is_some() {
             PRESENCE_PROBE_EVERY
         } else {
             RECONNECT_EVERY
         };
-        let cmd = match rx.recv_timeout(tick) {
-            Ok(cmd) => cmd,
-            Err(RecvTimeoutError::Timeout) => {
+        let cmd = match recv_next(&ctrl_rx, &frame_rx, tick) {
+            Recv::Cmd(cmd) => cmd,
+            Recv::Tick => {
                 maintain(
                     &mut api,
                     &mut device,
@@ -146,8 +279,7 @@ fn usb_loop(rx: Receiver<UsbCommand>, connected: &AtomicBool, events: &Events) {
                 );
                 continue;
             }
-            // All senders dropped (event loop exited): nothing more to do.
-            Err(RecvTimeoutError::Disconnected) => break,
+            Recv::Done => break,
         };
 
         // Stop must be honored even without a device, or the thread would
@@ -158,9 +290,9 @@ fn usb_loop(rx: Receiver<UsbCommand>, connected: &AtomicBool, events: &Events) {
         // SetSession is pure bookkeeping: process it even without a device —
         // dropping it while the monitor was missing left the gate stale, so
         // after a reconnect every image sync frame was discarded forever.
-        // Monotonic: a SetSession parked in Engine::send's fallback thread
-        // can land after a newer session's registration; letting it regress
-        // the gate would discard the live session's frames forever.
+        // Monotonic: a SetSession from a superseded stop can land after a
+        // newer session's registration; letting it regress the gate would
+        // discard the live session's frames forever.
         if let UsbCommand::SetSession(s) = cmd {
             session.register(s);
             continue;
@@ -212,6 +344,7 @@ fn usb_loop(rx: Receiver<UsbCommand>, connected: &AtomicBool, events: &Events) {
                 UsbCommand::SendColors(s, _, _) => format!("FRAME s={s}"),
                 UsbCommand::Probe => "Probe".into(),
                 UsbCommand::Stop => "Stop".into(),
+                UsbCommand::Wake => "Wake".into(),
             };
             eprintln!(
                 "[usb] {kind} dev={} session={}",
@@ -245,7 +378,7 @@ fn execute(cmd: &UsbCommand, dev: &HidDevice, session: &SessionGate) -> bool {
         UsbCommand::StoreStaticColor(slot, r, g, b) => {
             usb_protocol::store_static_color(dev, *slot, *r, *g, *b)
         }
-        UsbCommand::SetSession(_) | UsbCommand::Probe | UsbCommand::Stop => {
+        UsbCommand::SetSession(_) | UsbCommand::Probe | UsbCommand::Stop | UsbCommand::Wake => {
             // Handled by the drain loop before the device guard. Reachable
             // only if that routing ever changes: ignore rather than panic —
             // a panic here kills the USB worker and with it every monitor
@@ -364,13 +497,26 @@ fn publish_state(connected: &AtomicBool, events: &Events, is_connected: bool, no
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::mpsc::TryRecvError;
+
+    fn colors(v: u8) -> [RGBColor; 48] {
+        [RGBColor { r: v, g: v, b: v }; 48]
+    }
+
+    /// The next control-plane command, asserted by pattern.
+    fn expect_ctrl(ctrl: &Receiver<UsbCommand>, want: &UsbCommand) {
+        match ctrl.try_recv() {
+            Ok(cmd) => assert_eq!(&cmd, want, "wrong control command"),
+            Err(e) => panic!("control plane empty: {e:?}"),
+        }
+    }
 
     #[test]
     fn session_registration_is_monotonic() {
         let mut gate = SessionGate::default();
         gate.register(5);
-        // A SetSession from an older stop, parked in a fallback thread and
-        // landing after a newer registration: must never regress the gate.
+        // A SetSession from an older stop, landing after a newer
+        // registration: must never regress the gate.
         gate.register(3);
         assert_eq!(gate.active, 5);
         gate.register(9);
@@ -387,5 +533,162 @@ mod tests {
         assert!(!gate.accepts(7)); // the stopped session's in-flight frame
         gate.register(9); // the next start
         assert!(gate.accepts(9));
+    }
+
+    #[test]
+    fn control_commands_keep_order_and_poke_the_frame_channel() {
+        let (tx, CommandRx { ctrl, frames }) = command_bus();
+        // A short burst (pokes beyond the frame-queue capacity are dropped by
+        // design — the worker is then demonstrably not blocked — so keep the
+        // burst inside it).
+        for i in 0..3u8 {
+            assert!(tx.control(UsbCommand::SetBrightness(i)));
+        }
+        for i in 0..3u8 {
+            expect_ctrl(&ctrl, &UsbCommand::SetBrightness(i));
+        }
+        // Each control enqueue left exactly one Wake on the frame channel.
+        for _ in 0..3 {
+            assert!(matches!(frames.try_recv(), Ok(UsbCommand::Wake)));
+        }
+        assert!(matches!(frames.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    #[test]
+    fn frames_are_lossy_when_the_queue_is_full() {
+        let (tx, CommandRx { ctrl, frames }) = command_bus();
+        for _ in 0..FRAME_QUEUE {
+            assert!(tx.frame(7, colors(1), false));
+        }
+        // Saturated: the next frame is dropped, never blocking the producer.
+        assert!(!tx.frame(7, colors(2), false));
+        // And control commands still go through untouched.
+        assert!(tx.control(UsbCommand::TurnOff));
+        drop(tx);
+        drop(ctrl);
+        drop(frames);
+    }
+
+    #[test]
+    fn sendcolors_routed_through_control_takes_the_lossy_path() {
+        let (tx, CommandRx { ctrl, frames }) = command_bus();
+        assert!(tx.control(UsbCommand::SendColors(3, colors(9), true)));
+        assert!(matches!(ctrl.try_recv(), Err(TryRecvError::Empty)));
+        match frames.try_recv() {
+            Ok(UsbCommand::SendColors(s, c, a)) => {
+                assert_eq!((s, c[0].r, a), (3, 9, true));
+            }
+            other => panic!("frame missing from the data plane: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn control_plane_is_drained_before_a_saturated_frame_queue() {
+        let (tx, CommandRx { ctrl, frames }) = command_bus();
+        for _ in 0..FRAME_QUEUE {
+            assert!(tx.frame(7, colors(1), false));
+        }
+        assert!(!tx.frame(7, colors(2), false)); // saturated
+                                                 // The menu's stop + manual sequence, enqueued while saturated.
+        tx.control(UsbCommand::SetSession(8));
+        tx.control(UsbCommand::SetStaticColor(2, 0xAA, 0, 0));
+        let long = Duration::from_secs(120);
+        // Both commands are serviced before ANY frame, in order.
+        match recv_next(&ctrl, &frames, long) {
+            Recv::Cmd(UsbCommand::SetSession(8)) => {}
+            other => panic!("expected SetSession first, got {other:?}"),
+        }
+        match recv_next(&ctrl, &frames, long) {
+            Recv::Cmd(UsbCommand::SetStaticColor(2, 0xAA, 0, 0)) => {}
+            other => panic!("expected the manual command second, got {other:?}"),
+        }
+        // Only now does a frame come through.
+        match recv_next(&ctrl, &frames, long) {
+            Recv::Cmd(UsbCommand::SendColors(..)) => {}
+            other => panic!("expected a frame, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn control_enqueue_wakes_a_worker_blocked_on_frames() {
+        let (tx, CommandRx { ctrl, frames }) = command_bus();
+        let waiter = thread::spawn(move || {
+            // The worker's only blocking wait: nothing on either channel.
+            recv_next(&ctrl, &frames, Duration::from_secs(30))
+        });
+        thread::sleep(Duration::from_millis(100)); // let it block
+        tx.control(UsbCommand::Probe);
+        match waiter.join().unwrap() {
+            Recv::Cmd(UsbCommand::Probe) => {}
+            other => panic!("control command did not wake the waiter: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn recv_next_times_out_and_finishes_on_disconnect() {
+        let (tx, CommandRx { ctrl, frames }) = command_bus();
+        assert!(matches!(
+            recv_next(&ctrl, &frames, Duration::from_millis(10)),
+            Recv::Tick
+        ));
+        drop(tx);
+        assert!(matches!(
+            recv_next(&ctrl, &frames, Duration::from_millis(10)),
+            Recv::Done
+        ));
+    }
+
+    /// The scenario the bus exists for, end to end at the channel level with
+    /// the worker's own scheduling step and session gate: a saturated frame
+    /// queue of a running session, the stop + manual click sequence, and a
+    /// late in-flight frame from the dying session (the check→send race the
+    /// engine threads can lose during shutdown). The late frame must be
+    /// discarded by the gate — it can never execute after the manual
+    /// command, whatever the timing.
+    #[test]
+    fn stopped_sessions_late_frame_never_overtakes_the_manual_command() {
+        let (tx, CommandRx { ctrl, frames }) = command_bus();
+        // Session 5 is running and has saturated the frame queue.
+        for _ in 0..FRAME_QUEUE {
+            assert!(tx.frame(5, colors(1), false));
+        }
+        // The dying engine's in-flight frame: enqueued some time AFTER the
+        // stop and the manual command (the worst case of the race).
+        let late = tx.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(25));
+            let _ = late.frame(5, colors(2), false);
+        });
+        // The menu sequence, same thread: stop() then the manual click.
+        tx.control(UsbCommand::SetSession(6)); // stop()'s dead token
+        tx.control(UsbCommand::SetStaticColor(2, 0xAA, 0, 0));
+        drop(tx);
+
+        // A slow USB consumer built from the worker's own pieces: the
+        // scheduling step (control plane first), the session gate, and a
+        // per-write delay emulating a stalled HID writer.
+        let mut gate = SessionGate::default();
+        gate.register(5);
+        let mut saw_manual = false;
+        let mut stale_after_manual = 0;
+        loop {
+            match recv_next(&ctrl, &frames, Duration::from_millis(200)) {
+                Recv::Cmd(UsbCommand::SetSession(s)) => gate.register(s),
+                Recv::Cmd(UsbCommand::SendColors(s, _, _)) => {
+                    if gate.accepts(s) && saw_manual {
+                        stale_after_manual += 1;
+                    }
+                }
+                Recv::Cmd(UsbCommand::SetStaticColor(..)) => saw_manual = true,
+                Recv::Cmd(_) => {}
+                Recv::Tick | Recv::Done => break,
+            }
+            thread::sleep(Duration::from_millis(2)); // the slow write
+        }
+        assert!(saw_manual, "the manual command was never serviced");
+        assert_eq!(
+            stale_after_manual, 0,
+            "a stale frame of the stopped session executed after the manual command"
+        );
     }
 }

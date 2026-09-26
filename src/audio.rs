@@ -76,8 +76,12 @@ pub struct LoopbackLoudness {
     queue: VecDeque<u8>,
     /// Envelope state (fast attack, slow release) in 0..1.
     level: f32,
-    /// Friendly name of the render device the loopback was opened on.
-    device_name: String,
+    /// Endpoint ID (WASAPI `IMMDevice::GetId`) of the render device the
+    /// loopback was opened on. The friendly name is NOT a stable identity —
+    /// two devices can share one, and a user rename changes it — while the
+    /// endpoint ID is the unique, immutable string Windows itself keys
+    /// default-device switching on.
+    device_id: String,
     polls_since_check: u32,
 }
 
@@ -92,7 +96,7 @@ impl LoopbackLoudness {
         let device = enumerator
             .get_default_device(&Direction::Render)
             .map_err(|e| e.to_string())?;
-        let device_name = device.get_friendlyname().map_err(|e| e.to_string())?;
+        let device_id = device.get_id().map_err(|e| e.to_string())?;
         let mut audio_client = device.get_iaudioclient().map_err(|e| e.to_string())?;
         let format: WaveFormat = audio_client.get_mixformat().map_err(|e| e.to_string())?;
         // Capture direction on a render device = loopback: the crate sets
@@ -116,16 +120,18 @@ impl LoopbackLoudness {
             capture_client,
             queue: VecDeque::new(),
             level: 0.0,
-            device_name,
+            device_id,
             polls_since_check: 0,
         })
     }
 
-    /// True when the default render device's friendly name differs from the
-    /// one this loopback was opened on: the old capture then keeps
-    /// delivering that device's silence without ever failing, and only a
-    /// reopen picks up the new output. Errors read as "unchanged" — a real
-    /// device loss surfaces through the capture failures instead.
+    /// True when the default render device's endpoint ID differs from the
+    /// one this loopback was opened on: the old capture then keeps delivering
+    /// that device's silence without ever failing, and only a reopen picks
+    /// up the new output. Comparing endpoint IDs (not friendly names) keeps
+    /// this correct when the new default merely shares a name, or the old
+    /// one got renamed. Errors read as "unchanged" — a real device loss
+    /// surfaces through the capture failures instead.
     fn default_device_changed(&self) -> bool {
         let Ok(enumerator) = DeviceEnumerator::new() else {
             return false;
@@ -134,8 +140,8 @@ impl LoopbackLoudness {
             return false;
         };
         device
-            .get_friendlyname()
-            .map(|name| name != self.device_name)
+            .get_id()
+            .map(|id| id != self.device_id)
             .unwrap_or(false)
     }
 
